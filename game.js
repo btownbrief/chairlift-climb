@@ -3,7 +3,9 @@
 (function () {
   'use strict';
   const { W, H, STAGES } = window.CC_STAGES;
-  const ART = window.CC_ART, A = window.CC_AUDIO, PAL = ART.PAL;
+  const ART = window.CC_ART, PAL = ART.PAL, AUDIO = window.CC_AUDIO;
+  let A = AUDIO;
+  const MUTE = new Proxy({}, { get: (o, k) => (k in AUDIO && typeof AUDIO[k] !== 'function' ? AUDIO[k] : () => {}) });
   const $ = (id) => document.getElementById(id);
   const TAU = Math.PI * 2;
   const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
@@ -17,17 +19,16 @@
 
   // ---- tuning (world units = 1/240 of the play width)
   const DT = 1 / 120;
-  const GRAV = 600, JUMP_V = 182, RUN = 62, CLIMB = 48, AIR_ACC = 560, MAXFALL = 330;
-  const JUMP_PTS = 200, TIME_PTS = 50, CLOSE_PTS = 150, TOK_VAL = [200, 400, 600], ALL_TOKS = 1000, GOLD_X = 2, GOLD_SPEED = 1.55;
-  const EXTRA_LIVES = [10000, 30000, 60000, 100000, 150000, 225000, 300000];
+  // a short, committed jump: ~0.55 s in the air, fast fall, little mid-air steering (you can trim a landing, not turn around)
+  const GRAV = 680, FALL_K = 1.25, APEX_K = 0.85, JUMP_V = 186, RUN = 66, CLIMB = 54, AIR_ACC = 240, AIR_DRAG = 40, MAXFALL = 330;
+  const LAST_CHAIR = 1000, JUMP_PTS = 200, TIME_PTS = 50, CLOSE_PTS = 150, TOK_VAL = [200, 400, 600], ALL_TOKS = 1000, GOLD_X = 2, GOLD_SPEED = 1.3;
+  const EXTRA_LIVES = [15000, 50000, 120000, 250000];
   // the streak has to be fed: from stage 3 (and on every later lap) the multiplier drops a tier when you go too long without a jump, smash, close shave or maple
   const decayTime = (m) => Math.max(2.5, (G.loop > 0 ? 5 : 6.5) - ((m || streakMult()) - 2)); // x2 6.5 s ... x5 3.5 s (5 s ... 2.5 s on later laps)
   const decayOn = () => G.stageIdx >= 1 || G.loop > 0;
   // every lap past the first adds one rule (and the clock keeps tightening)
   const LAP_RULE = ['', 'MIRRORED · FASTER · GOLD BARRELS', 'DOUBLE THROWS: TWO TO JUMP AT ONCE', 'WIND GUSTS ON EVERY STAGE', 'BOUNCING BARRELS EVERYWHERE', 'SLICK ICE ON EVERY CATWALK', 'GOLD RUSH: HALF THE BARRELS ARE GOLD', 'TRIPLE THROWS: THREE TO JUMP IN A ROW'];
-  const LAP_CHIP = ['', '◆ MIRROR', '◆ DOUBLES', '◆ WINDY', '◆ BOUNCY', '◆ SLICK', '◆ GOLD', '◆ TRIPLES'];
   const lapRule = (L) => LAP_RULE[L] || 'THE CLOCK TIGHTENS AGAIN';
-  const lapChip = (L) => LAP_CHIP[L] || '◆ LAP ' + (L + 1);
   const streakMult = () => Math.min(5, 1 + Math.floor(Math.max(0, G.streak - 1) / 2)); // x1, x2 at a 3-streak, x3 at 5, x4 at 7, x5 at 9
   const CLOSE_GAP = 4; // units of daylight between boots and barrel hitbox that count as a near miss
   const COYOTE = 0.12, JBUF = 0.14, LADDER_SNAP = 8, SEAM = 3.6;
@@ -48,7 +49,7 @@
     { id: 'snow', name: 'Snowball Day', desc: 'The moose only rolls snowballs. They split!', snow: 0.8 },
     { id: 'ice', name: 'Black Ice', desc: 'Every catwalk is slick today', ice: true },
     { id: 'moon', name: 'Moon Boots', desc: 'Higher, floatier jumps', jump: 1.1, grav: 0.86 },
-    { id: 'bouncy', name: 'Bouncy Barrels', desc: 'Lots of bouncers. Watch the markers', bouncer: 0.32 },
+    { id: 'bouncy', name: 'Bouncy Barrels', desc: 'Lots of bouncers. Watch the markers', bouncer: 0.22 },
     { id: 'hurry', name: 'Moose in a Hurry', desc: 'Faster throws, more to jump', every: 0.8 },
     { id: 'poles', name: 'Ski Pole Day', desc: 'Ski poles last twice as long', poles: 2 },
     { id: 'gold', name: 'Gold Rush', desc: 'Fast gold barrels pay double', sprint: 0.4 }
@@ -64,7 +65,10 @@
   function streakNow() { return save.sLast === dayKey() || save.sLast === dayKey(-1) ? save.sN : 0; }
   // lift tickets: 4 per stage. bit 1 = reached the lodge, 2 = beat par time, 4 = no falls on the stage, 8 = all three maple tokens, 16 = reach the lodge with a x3+ streak still burning
   const PAR = 0.45; // fraction of the stage clock you must still have left
-  const stageTime = (st) => st.time - Math.min(10, 2 * G.loop); // later laps run a tighter clock
+  // the clock is set from each stage's real length (st.bot = the reflex bot's average clear) and tightens every stage you reach
+  // 1.5x at heat 0 (a skilled clear uses 55-75% of it), tightening 0.01x a stage to a 1.45x floor: later laps are already slower going
+  const stageTime = (st) => Math.round(st.bot * Math.max(1.45, 1.5 - 0.01 * (G.loop * 6 + G.stageIdx)));
+  const respawnTime = (st) => Math.min(G.timeMax, Math.max(12, Math.round(G.timeMax * 0.85))); // a fall costs time (the clock keeps running), but never leaves less than 85% of a clock: no death spirals into a clock-out
   const parFor = (st) => Math.ceil(stageTime(st) * PAR);
   const tixCount = (m) => (m & 1) + ((m >> 1) & 1) + ((m >> 2) & 1) + ((m >> 3) & 1) + ((m >> 4) & 1);
   const TIX_MAX = 30, TIX_NAMES = ['LODGE', 'SPEEDY', 'NO FALL', 'MAPLES', 'HOT ×3'];
@@ -166,7 +170,8 @@
       poles: st.poles && st.poles.map((q) => [M(q[0]), q[1]]),
       toks: st.toks && st.toks.map((q) => [M(q[0]), q[1], q[2]]),
       toksB: st.toksB && st.toksB.map((q) => [M(q[0]), q[1], q[2]]),
-      guide: st.guide && st.guide.map(M)
+      guide: st.guide && st.guide.map(M),
+      first: st.first != null ? M(st.first) : null
     });
   }
   function gondolaPos(m, s) {
@@ -179,8 +184,9 @@
     const st = G.st;
     G.barrels = []; G.parts = []; G.pops = [];
     // the first-ever climb gets 10 extra seconds while you learn
-    if (fresh) G.timeMax = stageTime(st) + (save.tut < 1 && G.stageIdx === 0 && G.loop === 0 ? 10 : 0);
-    G.timeLeft = G.timeMax; G.lastSec = Math.ceil(G.timeLeft);
+    if (fresh) { G.timeMax = stageTime(st) + (save.tut < 1 && G.stageIdx === 0 && G.loop === 0 ? 10 : 0); G.timeLeft = G.timeMax; }
+    else G.timeLeft = Math.max(G.timeLeft, respawnTime(st)); // the clock keeps running through a fall
+    G.lastSec = Math.ceil(G.timeLeft); G.runT = 0; G.lastChair = false;
     jumpPressed = false; G.streakT = decayTime();
     const fp = platAt(st.start.x, 318, 2) || G.plats[0];
     G.p = {
@@ -189,10 +195,11 @@
       minGap: 99, poles: 0, swing: 0, inv: 1.2, blinkT: 2, hurt: false, rot: 0, airT: 0, onIce: false
     };
     const mx = st.moose.x, dp = G.deckP;
-    G.moose = { x: mx, y: dp ? surf(dp, mx) : 100, plat: dp, face: st.moose.dirs[0], state: 'idle', k: 0, t: 0, timer: G.stageIdx === 0 && G.loop === 0 && save.tut < 1 ? 1.8 : 0.5, throws: 0, blinkT: 3, patrolT: 2, target: mx, chargeT: 8, mode: 'idle' };
+    G.moose = { x: mx, y: dp ? surf(dp, mx) : 100, plat: dp, face: st.moose.dirs[0], state: 'idle', k: 0, t: 0, timer: G.stageIdx === 0 && G.loop === 0 && save.tut < 1 ? 1.8 : 0.15, throws: 0, blinkT: 3, patrolT: 2, target: mx, chargeT: 8, mode: 'idle' };
     for (const it of G.items) it.taken = false;
-    if (!G.noBarrels && G.deckP) {
-      // two barrels already rolling high up, so there's something coming at you in the first seconds
+    const tut = save.tut < 1 && G.stageIdx === 0 && G.loop === 0;
+    if (!G.noBarrels && G.deckP && tut) {
+      // first-ever climb: two barrels already rolling high up, so there's something coming at you in the first seconds
       const cands = G.plats.filter((q) => !q.deck && !q.goal && !q.ground && (q.x2 - q.x1) > 40 && Math.max(q.y1, q.y2) < 250);
       for (let i = 0; i < 2 && cands.length; i++) {
         const q = cands.splice((rng() * cands.length) | 0, 1)[0], x = rnd(q.x1 + 10, q.x2 - 10), d = diff();
@@ -201,7 +208,24 @@
     }
     G.mist = st.mist ? { t: 5, phase: 'idle', band: 0, a: 0, k: 0 } : null;
     G.wind = st.wind || G.loop >= 3 ? { t: 5, phase: 'idle', dir: 1, v: 0, k: 0 } : null;
-    G.banner = 2.2; G.hint = null;
+    // the moose has been at it all afternoon: the catwalks are already busy when you arrive, so the lower tiers are live from the first step
+    // stage 1 on the first lap is the gentlest: a shorter warm-up leaves about four barrels on the board instead of six or seven
+    if (!G.noBarrels && G.deckP && !tut) prewarm(G.stageIdx === 0 && G.loop === 0 && !G.daily ? 4 : 7);
+    G.banner = 1.5; G.hint = null;
+  }
+
+  function prewarm(sec) {
+    const p = G.p, shake = G.shake; G.p = null; G.warm = true; A = MUTE;
+    try { for (let t = 0; t < sec; t += DT) { updateMoose(DT); updateBarrels(DT); } }
+    finally { A = AUDIO; G.p = p; G.warm = false; G.shake = shake; G.parts = []; G.pops = []; }
+    // nothing right on top of the start, and the moose's next throw is aimed at you
+    G.barrels = G.barrels.filter((b) => Math.hypot(b.x - p.x, b.y - p.y) > 30);
+    // and nothing on, above (two catwalks up) or within 70 units of the first ladder, so the opening walk and climb are yours to read (spawn and every respawn)
+    const fx = G.st.first, L1 = fx == null ? null : G.ladders.find((L) => Math.abs(L.x - fx) < 1 && L.botP === platAt(p.x, p.y, 2));
+    const zx = Math.max(70, diff().speed * 1.4); // about 1.4 s of rolling, so faster laps clear a wider zone
+    if (L1) G.barrels = G.barrels.filter((b) => !(b.lad === L1 || (Math.abs(b.x - L1.x) < zx && b.y <= L1.bot + 4 && b.y >= L1.top - 90)));
+    G.barrels = G.barrels.filter((b) => b.type !== 'bouncer' && !(b.lob && b.state === 'fall')); // and no bouncers or lobs already in the air
+    G.moose.throws = Math.max(G.moose.throws, 3);
   }
 
   // ---------------------------------------------------------------- input
@@ -431,7 +455,10 @@
     // lift tickets (regular climbs only, so daily twists can't hand them out)
     const got = 1 | (G.timeLeft >= parFor(G.st) ? 2 : 0) | (G.stageFalls === 0 ? 4 : 0) | (G.tokN >= 3 ? 8 : 0) | (streakMult() >= 3 ? 16 : 0);
     // personal best time on this stage (a single attempt: dying restarts the clock)
-    G.clearTime = G.timeMax - G.timeLeft; G.pbNew = false; G.pbOld = 0;
+    G.clearTime = G.runT; G.pbNew = false; G.pbOld = 0;
+    // racing the lift: made it with under five seconds on the clock
+    G.lastChair = G.timeLeft < 5;
+    if (G.lastChair) { addScore(LAST_CHAIR, 'time'); pop(G.p.x, G.p.y - 30, 'LAST CHAIR +' + LAST_CHAIR.toLocaleString(), '#ff8a6a', 1.6, 1.25); setTimeout(() => A.oneUp(), 250); }
     G.lapMsg = null;
     if (!G.daily) {
       const k = btKey(G.stageIdx, G.mirror), old = save.bt[k] || 0; G.pbOld = old;
@@ -459,7 +486,7 @@
     if (idx >= STAGES.length) {
       idx = 0; G.loop++; G.lapT = 0; G.lapValid = true;
       const msg = ['', '◆ LAP 2: MIRRORED & FASTER', '◆ LAP 3: DOUBLE THROWS', '◆ LAP 4: WIND EVERYWHERE', '◆ LAP 5: BOUNCING BARRELS', '◆ LAP 6: SLICK ICE', '◆ LAP 7: GOLD RUSH', '◆ LAP 8: TRIPLE THROWS'][G.loop] || '◆ LAP ' + (G.loop + 1) + ': CLOCK TIGHTENS';
-      setTimeout(() => { if (G.mode === 'play') pop(120, 112, msg, '#ffd23f', 2.6, 0.9); }, 60);
+      setTimeout(() => { if (G.mode === 'play') pop(120, 112, msg, '#ffd23f', 2.6, 0.9, true); }, 60);
     }
     enterStage(idx, true);
   }
@@ -467,7 +494,6 @@
   function dropStreak() {
     const m = streakMult(); if (m < 2) return;
     G.streak = 2 * m - 3; G.streakT = decayTime(); G.streakPulse = 0.6; A.streakDrop();
-    if (G.p) pop(G.p.x, G.p.y - 34, 'STREAK FADING ×' + (m - 1), '#ff9a8a', 1.1, 0.95);
   }
   function addScore(n, cat) {
     if (cat && G.stats) { const by = G.stats.by || (G.stats.by = {}); by[cat] = (by[cat] || 0) + n; }
@@ -475,18 +501,27 @@
     G.score += n;
     if (!G.passedBest && bestBefore > 0 && G.score > bestBefore && G.p) {
       G.passedBest = true; A.oneUp(); vibe([10, 40, 10, 40, 20]);
-      pop(120, 64, G.daily ? "NEW BEST TODAY!" : 'NEW BEST!', '#ffd23f', 1.8, 1.7); burst(120, 70, 30, ['#ffd23f', '#fff', '#ff7a5a', '#7dffb0'], 90, 'conf');
+      pop(120, 64, G.daily ? "NEW BEST TODAY!" : 'NEW BEST!', '#ffd23f', 1.8, 1.7, true); burst(120, 70, 30, ['#ffd23f', '#fff', '#ff7a5a', '#7dffb0'], 90, 'conf');
     }
     if (G.extra.length && G.score >= G.extra[0]) { G.extra.shift(); G.lives = Math.min(6, G.lives + 1); A.oneUp(); pop(G.p.x, G.p.y - 30, '1UP!', '#7dffb0', 1.3); }
   }
 
   // difficulty for the current stage
+  // heat: one number that ramps every stage you reach (stage 1 = 0, the first Black Diamond stage = 6, and so on)
+  const heatNow = () => G.loop * STAGES.length + G.stageIdx;
   function diff() {
-    const st = G.st, L = G.loop;
+    const st = G.st, L = G.loop, h = heatNow();
+    // throw-to-throw interval: 2.0 s at heat 0, 0.1 s quicker per stage, 1.15 s floor. The last ten seconds hurry the moose.
+    const hurry = G.mode === 'play' && G.timeLeft <= 10 && G.timeMax > 0 ? 0.75 : 1;
+    const interval = Math.max(1.15, 2.0 - 0.1 * h) * (st.throwK || 1) * (G.mod.every || 1) * hurry;
+    const anim = clamp(interval / 2, 0.62, 1); // wind-up, shove and stomp shrink with the interval (tells stay readable)
     return {
-      every: st.throwEvery * Math.pow(0.86, L), speed: st.speed * (1 + 0.12 * Math.min(L, 3)), snow: st.snowball,
-      bouncer: G.stageIdx >= 3 || L > 0 ? Math.max(st.bouncer, L > 0 ? 0.12 : 0, L >= 4 ? 0.3 : 0) : st.bouncer, lob: L > 0 ? Math.max(st.lob, 0.15) : st.lob,
-      sprint: L >= 6 ? 0.5 : Math.min(0.4, Math.max(st.sprint || 0, G.mod.sprint || 0) + (L > 0 ? 0.1 + 0.04 * (L - 1) : 0))
+      interval, anim, every: Math.max(0.12, interval - anim * (0.94 + 0.4 * (st.lob + st.bouncer))), heat: h, hurry: hurry < 1,
+      // barrels never outrun you (66) before heat 10; from heat 10 (lap 2's last stages, then lap 3) they gain 2 more a stage, up to 72, so one behind you is a threat
+      speed: Math.min(h >= 10 ? 72 : 66, st.speed + 1.8 * h + 2 * Math.max(0, h - 9)), snow: G.mod.snow || st.snowball,
+      bouncer: Math.max(G.mod.bouncer || 0, G.stageIdx >= 3 || L > 0 ? Math.max(st.bouncer, L > 0 ? 0.06 : 0, L >= 4 ? 0.2 : 0) : st.bouncer), lob: L > 0 ? Math.max(st.lob, 0.15) : st.lob,
+      sprint: L >= 6 ? 0.3 : Math.min(G.mod.sprint ? 0.3 : 0.2, Math.max(st.sprint || 0, G.mod.sprint || 0) + (L > 0 ? 0.04 + 0.02 * (L - 1) : 0)),
+      ladder: Math.min(1.8, 1 + 0.08 * h)
     };
   }
 
@@ -498,7 +533,8 @@
     }
   }
   function spray(x, y, dir, n) { for (let i = 0; i < n; i++) G.parts.push({ x, y, vx: -dir * crnd(10, 45) + crnd(-10, 10), vy: crnd(-45, -10), life: crnd(0.25, 0.5), t: 0, c: '#fff', k: 'snow', r: crnd(0.5, 1.3), g: 200 }); }
-  function pop(x, y, text, col, life, big) { G.pops.push({ x, y, text, col: col || '#fff', life: life || 0.9, t: 0, big: big || 1 }); }
+  // at most one pop-up near the player at a time (the newest replaces it); centre messages (lap, new best, lift closed) are separate
+  function pop(x, y, text, col, life, big, center) { if (!center) G.pops = G.pops.filter((q) => q.center); G.pops.push({ x, y, text, col: col || '#fff', life: life || 0.9, t: 0, big: big || 1, center: !!center }); }
 
   // ---------------------------------------------------------------- moose
   function spawnBarrel(m, dir, kind, lob) {
@@ -506,7 +542,7 @@
     const plat = m.plat;
     const sx = clamp(m.x + dir * 14, plat.x1 + 1, plat.x2 - 1);
     const gold = kind === 'sprint'; if (gold) kind = 'barrel';
-    const b = { type: kind, gold, x: sx, y: surf(plat, sx), r: kind === 'snow' ? 5.8 : 6.1, dir, speed: d.speed * (kind === 'snow' ? 1.08 : gold ? Math.min(GOLD_SPEED, 84 / d.speed) : 1) * rnd(0.94, 1.06), state: 'roll', plat, rot: 0, age: 0, jumpedId: -1, lastLadder: null, fallFrom: 0, hops: 0 };
+    const b = { type: kind, gold, x: sx, y: surf(plat, sx), r: kind === 'snow' ? 5.8 : 6.1, dir, speed: d.speed * (kind === 'snow' ? 1.08 : gold ? Math.min(GOLD_SPEED, 80 / d.speed) : 1) * rnd(0.96, 1.04), state: 'roll', plat, rot: 0, age: 0, jumpedId: -1, lastLadder: null, fallFrom: 0, hops: 0 };
     if (kind === 'bouncer') { b.state = 'bounce'; b.vx = dir * d.speed * 0.8; b.vy = -120; b.y -= 1; b.glow = 0.01; }
     if (lob) {
       // lob into the middle of a random lower platform; the landing spot is marked
@@ -516,19 +552,32 @@
         let tx = rnd(tp2.x1 + 14, tp2.x2 - 14); if (mine && Math.abs(tx - G.p.x) < 34) tx = clamp(G.p.x + (tx < G.p.x ? -1 : 1) * rnd(34, 60), tp2.x1 + 10, tp2.x2 - 10); if (mine && Math.abs(tx - G.p.x) < 30) tx = clamp(G.p.x + (G.p.x < (tp2.x1 + tp2.x2) / 2 ? 1 : -1) * 40, tp2.x1 + 10, tp2.x2 - 10);
         // on a catwalk that drains one way, land the barrel uphill of you so it rolls into you head-on (marked, whistled, jumpable)
         if (mine) { const sd = slopeDir(mine, 0); if (sd) { const want = G.p.x - sd * rnd(36, 64); if (want > mine.x1 + 10 && want < mine.x2 - 10) tx = want; } }
+        // never land a lob just up-flow of a ladder foot or top: a climber stepping off needs 0.7 s of warning
+        // (the window allows for the hop a lob makes after it lands)
+        const fd = slopeDir(tp2, Math.sign(tx - b.x) || dir);
+        for (let pass = 0; pass < 2; pass++) for (const L of G.ladders) {
+          if (L.botP !== tp2 && L.topP !== tp2) continue;
+          const dd = (L.x - tx) * fd;
+          if (dd > -14 && dd < 56) { const up = L.x - fd * 58, dn = L.x + fd * 16, fits = (x) => x > tp2.x1 + 8 && x < tp2.x2 - 8; tx = fits(up) ? up : fits(dn) ? dn : NaN; }
+        }
+        if (G.p && (G.p.ground === tp2 || (G.p.climb && (G.p.climb.botP === tp2 || G.p.climb.topP === tp2))) && Math.abs(tx - G.p.x) < 34) tx = NaN; // never shifted onto you
+        if (isNaN(tx)) { G.barrels.push(b); return b; } // no safe spot on that catwalk: throw it as a plain roll
         const ty = surf(tp2, tx), T = 1.05;
+        const keep = { x: b.x, y: b.y, dir: b.dir };
         b.state = 'fall'; b.vx = (tx - b.x) / T; b.vy = (ty - b.y - 0.5 * B_GRAV * T * T) / T; b.y -= 4; b.fallFrom = b.y; b.lob = true; b.dir = Math.sign(b.vx) || dir;
         predictMark(b);
+        // an arc that would clip the lodge perch on the way down is thrown as a plain roll instead
+        if (!b.mark || b.mark.plat !== tp2) { Object.assign(b, keep, { state: 'roll', vx: 0, vy: 0, lob: false, mark: null }); }
       }
     }
     G.barrels.push(b);
     return b;
   }
   function predictMark(b) {
-    let x = b.x, y = b.y, vx = b.vx, vy = b.vy; const h = 1 / 60;
-    for (let i = 0; i < 240; i++) {
+    let x = b.x, y = b.y, vx = b.vx, vy = b.vy; const h = DT;
+    for (let i = 0; i < 480; i++) {
       const py = y; vy += B_GRAV * h; x += vx * h; y += vy * h;
-      if (vy > 0) { const p = landPlat(x, py, y, null); if (p) { b.mark = { x, y: surf(p, x) }; return; } }
+      if (vy > 0) { const p = landPlat(x, py, y, null); if (p) { b.mark = { x, y: surf(p, x), plat: p, at: G.t + (i + 1) * h }; return; } }
       if (y > H + 10) break;
     }
     b.mark = null;
@@ -559,7 +608,7 @@
       m.y = surf(m.plat, m.x);
       return;
     }
-    if (G.mode !== 'play' && !G.demo) { m.state = 'idle'; return; }
+    if (G.mode !== 'play' && !G.demo && !G.warm) { m.state = 'idle'; return; }
     if (G.noBarrels) { m.state = 'idle'; return; }
     if (m.mode === 'idle') {
       m.state = 'idle'; m.timer -= dt;
@@ -567,23 +616,24 @@
       else if (m.timer <= 0) {
         m.throws++;
         m.dir = st.moose.dirs[(rng() * st.moose.dirs.length) | 0];
-        if (st.moose.dirs.length > 1 && G.p && (G.stageIdx + G.loop > 0 || m.throws > 2) && rng() < 0.7) m.dir = G.p.x < m.x ? -1 : 1; // lean toward the player's side (stage 1: after two warm-up throws)
+        if (st.moose.dirs.length > 1 && G.p && (G.stageIdx + G.loop > 0 || m.throws > 2) && rng() < (d.hurry ? 1 : 0.7)) m.dir = G.p.x < m.x ? -1 : 1; // lean toward the player's side (stage 1: after two warm-up throws); the last ten seconds, always
         m.face = m.dir;
         const r = rng();
         m.kind = r < d.bouncer ? 'bouncer' : r < d.bouncer + d.sprint ? 'sprint' : r < d.bouncer + d.sprint + d.snow ? 'snow' : 'barrel';
         m.lob = m.kind !== 'bouncer' && m.kind !== 'sprint' && rng() < d.lob;
+        if (G.mode === 'play' && G.modeT < 4 && (m.kind === 'bouncer' || m.lob)) { m.kind = 'barrel'; m.lob = false; } // the first 4 s of every life: nothing that arcs across tiers
         m.mode = m.throws % 4 === 0 && !st.moose.patrol ? 'stomp' : 'windup'; m.k = 0;
         if (m.mode === 'stomp') { m.state = 'stomp'; }
         if (m.kind === 'bouncer' || m.lob) A.whistle();
-        if (m.kind === 'sprint') { A.zip(); if (!save.tipGold && G.p) { save.tipGold = 1; persist(); pop(120, 126, 'GOLD BARREL = FAST. PAYS DOUBLE!', '#ffd23f', 2.2, 1.0); } }
+        if (m.kind === 'sprint') { A.zip(); if (!save.tipGold && G.p) { save.tipGold = 1; persist(); pop(120, 126, 'GOLD HOOP = FAST. PAYS DOUBLE!', '#ffd23f', 2.2, 1.0, true); } }
       }
     } else if (m.mode === 'stomp') {
       m.state = 'stomp';
-      if (m.k > 0.25 && !m.stomped) { m.stomped = true; G.shake = Math.max(G.shake, 1.8); A.stomp(); spray(m.x + m.face * 10, m.y, -m.face, 8); spray(m.x + m.face * 10, m.y, m.face, 8); vibe(10); }
-      if (m.k > 0.55) { m.stomped = false; m.mode = 'windup'; m.k = 0; }
+      if (m.k > 0.25 * d.anim && !m.stomped) { m.stomped = true; A.stomp(); spray(m.x + m.face * 10, m.y, -m.face, 8); spray(m.x + m.face * 10, m.y, m.face, 8); vibe(10); }
+      if (m.k > 0.55 * d.anim) { m.stomped = false; m.mode = 'windup'; m.k = 0; }
     } else if (m.mode === 'windup') {
       m.state = 'windup';
-      const wl = m.kind === 'bouncer' || m.lob ? 0.85 : m.kind === 'sprint' ? 0.8 : m.secondThrow ? 0.42 : 0.45;
+      const wl = (m.kind === 'bouncer' || m.lob ? 0.85 : m.kind === 'sprint' ? 0.8 : m.secondThrow ? 0.42 : 0.45) * d.anim;
       if (m.k >= wl) {
         m.mode = 'shove'; m.k = 0; m.state = 'shove';
         spawnBarrel(m, m.dir, m.kind, m.lob);
@@ -591,11 +641,12 @@
       }
     } else if (m.mode === 'shove') {
       m.state = 'shove';
-      if (m.k > 0.35) {
+      if (m.k > 0.35 * d.anim) {
         m.mode = 'idle'; m.secondThrow = false;
-        if (m.pairLeft > 0) { m.pairLeft--; m.pair = true; m.timer = 0.1; } // lap 8+: sometimes a third
-        else if (!m.inPair && G.loop >= 2 && (m.kind === 'barrel' || m.kind === 'sprint') && !st.moose.patrol && rng() < Math.min(0.4, 0.18 + 0.07 * (G.loop - 2))) { m.inPair = true; m.pairLeft = G.loop >= 7 && rng() < 0.5 ? 1 : 0; m.pair = true; m.timer = 0.1; } // a pair, spaced for a double jump
-        else { m.inPair = false; m.timer = d.every * rnd(0.75, 1.25) * (G.p && G.p.y - m.y < 70 && G.p.y > m.y ? 0.72 : 1); }
+        const gapT = Math.max(0.05, 52 / d.speed - 0.77 * d.anim); // doubles and triples come ~52 units apart: stop, jump, land, jump
+        if (m.pairLeft > 0) { m.pairLeft--; m.pair = true; m.timer = gapT; } // lap 8+: sometimes a third
+        else if (!m.inPair && G.loop >= 2 && (m.kind === 'barrel' || m.kind === 'sprint') && !st.moose.patrol && rng() < Math.min(0.45, 0.3 + 0.07 * (G.loop - 2))) { m.inPair = true; m.pairLeft = G.loop >= 7 && rng() < 0.5 ? 1 : 0; m.pair = true; m.timer = gapT; } // a pair, spaced for a double jump
+        else { m.inPair = false; m.timer = d.every * rnd(0.75, 1.25); }
       } // the moose throws faster once you're close to its deck
     }
   }
@@ -653,7 +704,7 @@
     p.anim += dt; p.inv = Math.max(0, p.inv - dt);
     p.blinkT -= dt; if (p.blinkT < 0) { p.blink = p.blinkT > -0.1; if (p.blinkT < -0.1) p.blinkT = crnd(2, 5); }
     p.sx = lerp(p.sx, 1, 1 - Math.exp(-14 * dt)); p.sy = lerp(p.sy, 1, 1 - Math.exp(-14 * dt));
-    if (p.poles > 0) { p.poles -= dt; p.swing = Math.sin(p.anim * 16) * 1.2; if (Math.sin(p.anim * 16) > 0.97 && Math.sin((p.anim - dt) * 16) <= 0.97) A.swish(); if (p.poles <= 0) { p.poles = 0; pop(p.x, p.y - 24, 'poles away', '#ffd0dc', 0.8); } }
+    if (p.poles > 0) { p.poles -= dt; p.swing = Math.sin(p.anim * 16) * 1.2; if (Math.sin(p.anim * 16) > 0.97 && Math.sin((p.anim - dt) * 16) <= 0.97) A.swish(); if (p.poles <= 0) p.poles = 0; }
     if (jumpPressed) { p.jbuf = JBUF; jumpPressed = false; }
     else p.jbuf = Math.max(0, p.jbuf - dt);
     const wind = G.wind && G.wind.v ? G.wind.v : 0;
@@ -669,8 +720,8 @@
       if (p.y < duckY + 1) for (const b of G.barrels) {
         // looks ~0.3 s ahead, so you never pop out right in front of one
         if (b.state === 'roll' && b.plat === L.topP && Math.abs(b.x - L.x) < 12 + b.speed * 0.3 && (b.x - L.x) * b.dir < 3) { p.duck = true; break; }
+        if ((b.state === 'fall' || b.state === 'bounce') && b.mark && b.mark.plat === L.topP && Math.abs(b.mark.x - L.x) < 14 && b.mark.at - G.t < 0.35) { p.duck = true; break; }
       }
-      if (p.duck && !p.wasDuck) pop(L.x, L.top - 3, 'DUCK!', '#bfe9ff', 0.7, 0.75);
       p.wasDuck = p.duck;
       if (p.duck) { if (dir < 0) dir = 0; p.y = approach(p.y, Math.max(p.y, duckY), 170 * dt); }
       if (dir) {
@@ -681,7 +732,7 @@
       if (p.jbuf > 0 && L.bot - p.y > 4) {
         // hop off sideways
         const side = (I.r ? 1 : 0) - (I.l ? 1 : 0) || p.face || 1;
-        p.climb = null; p.jbuf = 0; p.vx = side * RUN * 0.8; p.vy = -110; p.face = side; p.fromY = p.y; p.jumpId++; p.jumpCleared = 0; p.jumpT = 1; p.airT = 0;
+        p.climb = null; p.jbuf = 0; p.vx = side * RUN * 0.8; p.vy = -125; p.face = side; p.fromY = p.y; p.jumpId++; p.jumpCleared = 0; p.jumpPts = 0; p.jumpT = 1; p.airT = 0;
         A.jump(); return;
       }
       if (p.y <= L.top) { p.y = L.top; p.climb = null; p.ground = L.topP; p.x = L.x; p.sy = 0.85; p.sx = 1.1; spray(p.x, p.y, 0, 3); }
@@ -710,7 +761,7 @@
           p.climb = L; p.ground = null; p.mover = null; p.y = L.top + 1; grabbed = true; break;
         }
       }
-      if (grabbed) { p.vx = 0; p.vy = 0; p.climbT = 0; p.jumpT = 0; p.state = 'climb'; return; }
+      if (grabbed) { p.vx = 0; p.vy = 0; p.climbT = 0; p.jumpT = 0; p.topY = null; p.state = 'climb'; return; }
     }
 
     // ---- horizontal
@@ -720,11 +771,11 @@
     if (p.ground || p.mover) {
       if (onIce) {
         if (want) p.vx += want * 190 * dt; else p.vx = approach(p.vx, 0, 48 * dt);
-        p.vx = clamp(p.vx, -80, 80);
+        p.vx = clamp(p.vx, -76, 76);
         if (Math.abs(p.vx) > 30 && cr() < dt * 30) spray(p.x, p.y, Math.sign(p.vx), 1);
       } else p.vx = approach(p.vx, want * RUN, 1500 * dt);
     } else {
-      p.vx = approach(p.vx, want * RUN, (want ? AIR_ACC : 90) * dt);
+      p.vx = approach(p.vx, want * RUN, (want ? AIR_ACC : AIR_DRAG) * dt);
       if (want === 0 && Math.abs(p.vx) > RUN) p.vx = approach(p.vx, Math.sign(p.vx) * RUN, 200 * dt);
     }
     if (want) p.face = want;
@@ -733,7 +784,7 @@
     if (p.jbuf > 0 && (p.ground || p.mover || p.coyote > 0)) {
       p.carry = p.mover ? p.mover.vx || 0 : 0;
       p.vy = -JUMP_V * (G.mod.jump || 1); p.fromY = p.y; p.ground = null; p.mover = null; p.coyote = 0; p.jbuf = 0;
-      p.jumpId++; p.jumpCleared = 0; p.minGap = 99; p.sx = 0.8; p.sy = 1.25; p.airT = 0; p.jumpT = 1;
+      p.jumpId++; p.jumpCleared = 0; p.jumpPts = 0; p.minGap = 99; p.sx = 0.8; p.sy = 1.25; p.airT = 0; p.jumpT = 1; p.topY = p.y;
       A.jump(); spray(p.x, p.y, p.face, 5);
     }
 
@@ -765,10 +816,10 @@
       if (p.ground && p.ground.ground) { const mv = moverAt(p.x, p.y, 1.6); if (mv) { p.mover = mv; p.ground = null; p.y = mv.top; } }
     } else {
       p.airT += dt;
-      if (cr() < dt * 26) G.parts.push({ x: p.x - p.face * 2 + crnd(-1, 1), y: p.y - crnd(0, 2), vx: -p.vx * 0.15, vy: crnd(-4, 4), life: crnd(0.25, 0.4), t: 0, c: 'rgba(255,255,255,.9)', k: 'snow', r: crnd(0.5, 1.1), g: 20 });
       p.coyote = Math.max(0, p.coyote - dt);
-      // floaty apex: gravity eases off near the top of the arc (more time over the barrel)
-      p.vy = Math.min(MAXFALL, p.vy + GRAV * (G.mod.grav || 1) * (Math.abs(p.vy) < 55 && p.jumpT > 0 ? 0.5 : 1) * dt);
+      // a slight hang at the apex, then a fast fall: the jump reads as a crisp arc, not a float
+      p.vy = Math.min(MAXFALL, p.vy + GRAV * (G.mod.grav || 1) * (p.vy > 0 ? FALL_K : 1) * (Math.abs(p.vy) < 55 && p.jumpT > 0 ? APEX_K : 1) * dt);
+      p.topY = Math.min(p.topY == null ? p.y : p.topY, p.y);
       const py = p.y;
       p.x += dx + p.carry * dt; p.y += p.vy * dt;
       if (p.vy > 0) {
@@ -806,9 +857,9 @@
         tk.taken = true; G.tokN++; G.stats.toks = (G.stats.toks || 0) + 1; feedStreak();
         const mult = streakMult(), pts = tk.val * mult;
         addScore(pts, 'maples'); A.token(G.tokN); vibe(8);
-        pop(tk.x, tk.y - 10, '+' + pts, '#ffd23f', 1.0, 1.15);
+        if (G.tokN < 3) pop(tk.x, tk.y - 10, '+' + pts, '#ffd23f', 1.0, 1.15);
         burst(tk.x, tk.y, 12, ['#ffd23f', '#ff9a3a', '#fff'], 55, 'spark');
-        if (G.tokN === 3) { addScore(ALL_TOKS, 'maples'); pop(p.x, p.y - 40, 'ALL 3 MAPLES! +' + ALL_TOKS.toLocaleString(), '#ffb347', 1.4, 1.2); G.hitStop = Math.max(G.hitStop, 0.04); burst(p.x, p.y - 12, 18, ['#ffd23f', '#ff9a3a', '#fff'], 80, 'conf'); }
+        if (G.tokN === 3) { addScore(ALL_TOKS, 'maples'); pop(p.x, p.y - 30, '+' + (pts + ALL_TOKS).toLocaleString() + ' ALL 3 MAPLES', '#ffb347', 1.4, 1.2); G.hitStop = Math.max(G.hitStop, 0.04); burst(p.x, p.y - 12, 18, ['#ffd23f', '#ff9a3a', '#fff'], 80, 'conf'); }
       }
     }
     // ---- goal
@@ -817,20 +868,21 @@
   }
   function onLand(p) {
     const fall = p.airT;
-    p.vy = 0; p.carry = 0; p.coyote = 0; p.jumpT = 0;
+    const drop = p.topY == null ? 0 : p.y - p.topY;
+    p.vy = 0; p.carry = 0; p.coyote = 0; p.jumpT = 0; p.topY = null;
     const s = clamp(fall * 1.4, 0.15, 0.6);
     p.sy = 1 - s * 0.55; p.sx = 1 + s * 0.45;
-    A.land(0.5 + s); spray(p.x, p.y, 1, 3 + (s * 8) | 0); spray(p.x, p.y, -1, 3 + (s * 8) | 0);
-    if (s > 0.3) G.parts.push({ x: p.x, y: p.y, vx: 0, vy: 0, life: 0.32, t: 0, c: '#fff', k: 'ring', r: 3, g: 0 });
+    A.land(0.5 + s); spray(p.x, p.y, 1, 2); spray(p.x, p.y, -1, 2);
+    if (drop > 30) G.parts.push({ x: p.x, y: p.y, vx: 0, vy: 0, life: 0.32, t: 0, c: '#fff', k: 'ring', r: 3, g: 0 });
     // a close shave (boots skimmed the barrel) pays extra once you land safely: late, brave jumps are worth it
     if (p.jumpCleared > 0 && p.minGap < CLOSE_GAP && G.mode === 'play') {
       feedStreak(); addScore(CLOSE_PTS * streakMult(), 'close'); G.stats.close = (G.stats.close || 0) + 1; A.clear(p.jumpCleared + 2, G.streak); vibe([6, 30, 10]);
-      pop(p.x, p.y - 30, 'CLOSE! +' + CLOSE_PTS * streakMult(), '#8fe3ff', 0.9, 1.05); burst(p.x, p.y - 2, 10, ['#8fe3ff', '#fff'], 60, 'spark');
+      pop(p.x, p.y - 30, '+' + (p.jumpPts + CLOSE_PTS * streakMult()).toLocaleString() + ' CLOSE', '#8fe3ff', 0.9, 1.1); burst(p.x, p.y - 2, 10, ['#8fe3ff', '#fff'], 60, 'spark');
     }
     p.minGap = 99; p.jumpCleared = 0;
   }
   let noClimbT = 0;
-  function noClimbHint() { if (G.t - noClimbT > 1.6) { noClimbT = G.t; pop(G.p.x, G.p.y - 26, "can't climb with poles", '#ffd0dc', 1.0, 0.8); } }
+  function noClimbHint() { if (G.t - noClimbT > 1.6) { noClimbT = G.t; A.thump(0.4); vibe(20); } } // no text: a buzz, and the blinking poles say why
 
   function hurtPlayer(reason) {
     const p = G.p;
@@ -842,17 +894,17 @@
     burst(p.x, p.y - 10, 10, ['#ffd23f', '#fff'], 70, 'star');
     G.moose.mode = 'laugh'; setTimeout(() => A.laugh(), 350);
     A.setRumble(0); A.setWind(0);
-    if (reason === 'closed') pop(120, 150, 'LIFT CLOSED!', '#ff8a6a', 1.8, 1.6);
+    if (reason === 'closed') pop(120, 150, 'LIFT CLOSED!', '#ff8a6a', 1.8, 1.6, true);
   }
   function updateDying(dt) {
     const p = G.p;
     p.anim += dt; p.rot += dt * 14 * (p.vx < 0 ? -1 : 1);
-    if (G.modeT < 1.25) {
+    if (G.modeT < 0.95) {
       const py = p.y; p.vy = Math.min(MAXFALL, p.vy + GRAV * dt); p.y += p.vy * dt; p.x = clamp(p.x + p.vx * dt, 5, W - 5);
       if (p.vy > 0) { const pl = landPlat(p.x, py, p.y, null); if (pl && G.modeT > 0.35) { p.y = surf(pl, p.x); p.vy = -p.vy * 0.35; p.vx *= 0.6; A.thump(0.7); spray(p.x, p.y, 1, 4); spray(p.x, p.y, -1, 4); if (Math.abs(p.vy) < 30) p.vy = 0; } }
       if (cr() < dt * 10) burst(p.x, p.y - 20, 1, ['#ffd23f'], 20, 'star');
     } else { p.rot = lerp(p.rot, Math.round(p.rot / TAU) * TAU, 0.2); }
-    if (G.modeT > 1.9) { G.moose.mode = 'idle'; G.moose.timer = 1.5; loseLife(G.reason); }
+    if (G.modeT > 1.3) { G.moose.mode = 'idle'; G.moose.timer = 1.5; loseLife(G.reason); }
   }
 
   // ---------------------------------------------------------------- barrels
@@ -867,14 +919,16 @@
       if (b.glow) b.glow += dt;
       const r = b.r;
       if (b.state === 'roll') {
-        const sp = b.speed * (b.plat.ice ? (b.gold ? 1.1 : 1.3) : 1) * (1 + 0.22 * windK * b.dir);
+        let hold = 1;
+        if (b.spaceT > 0) { b.spaceT -= dt; const L = b.lead; if (L && !L.dead && L.state === 'roll' && Math.abs(L.y - b.y) < 5 && L.dir === b.dir && (L.x - b.x) * b.dir < 50) hold = 0.65; else b.spaceT = 0; }
+        const sp = Math.min(86, b.speed * hold * (b.plat.ice ? 1.15 : 1) * (1 + 0.22 * windK * b.dir)); // everything gains the same on ice, so nothing catches up into a trap
         const px = b.x;
         b.x += b.dir * sp * dt; b.rot += b.dir * sp * dt / r;
         if (b.x >= b.plat.x1 && b.x <= b.plat.x2) b.y = surf(b.plat, b.x);
         else {
           const pl = platAt(b.x, b.y, SEAM, b.plat);
           if (pl) { b.plat = pl; b.y = surf(pl, b.x); }
-          else { b.state = 'fall'; b.vx = b.dir * sp * 0.7; b.vy = 8; b.fallFrom = b.y; }
+          else { b.state = 'fall'; b.vx = b.dir * Math.min(sp, 46) * 0.7; b.vy = 8; b.fallFrom = b.y; predictMark(b); } // drop-off arc is the same at every speed, so barrels cascade down the tiers instead of overshooting them
         }
         if (b.state === 'roll') {
           rumble += 1;
@@ -885,7 +939,7 @@
             if ((px - L.x) * (b.x - L.x) <= 0) {
               b.lastLadder = L;
               const below = p && p.y > b.y + 8;
-              if (rng() < (below ? 0.24 : 0.15) * (G.st.ladderDrop || 1) && b.type !== 'mini' && !b.gold) { b.state = 'teeter'; b.x = L.x; b.lad = L; b.tt = 0; A.rattle && A.rattle(vol(b)); }
+              if (rng() < (below ? 0.24 : 0.15) * (G.st.ladderDrop || 1) * d.ladder && b.type !== 'mini' && (!b.gold || d.heat > 6)) { b.state = 'teeter'; b.x = L.x; b.lad = L; b.tt = 0; A.rattle && A.rattle(vol(b)); }
               break;
             }
           }
@@ -898,7 +952,7 @@
         b.y += 58 * dt; b.x = b.lad.x; b.rot += dt * 3;
         if (b.y >= b.lad.bot) {
           b.y = b.lad.bot; b.plat = b.lad.botP; b.state = 'roll'; b.lastLadder = b.lad;
-          b.dir = slopeDir(b.plat, rng() < 0.5 ? -1 : 1); A.thump(0.5 * vol(b));
+          b.dir = slopeDir(b.plat, rng() < 0.5 ? -1 : 1); A.thump(0.5 * vol(b)); spaceOut(b);
         }
         rumble += 0.5;
       } else if (b.state === 'fall' || b.state === 'bounce') {
@@ -917,15 +971,14 @@
             } else if (b.type === 'snow' && drop > 14) {
               // snowball splits into two minis on impact
               b.dead = true; A.poof(); burst(b.x, b.y - 4, 12, ['#fff', '#dfe9ff'], 50, 'snow');
-              for (const s of [-1, 1]) G.barrels.push({ type: 'mini', x: b.x + s * 2, y: b.y, r: 3.8, dir: s, speed: d.speed * 1.15, state: 'fall', vx: s * 40, vy: -70, fallFrom: b.y, plat: pl, rot: 0, age: 0, jumpedId: b.jumpedId, lastLadder: null, hops: 1 });
+              for (const s of [-1, 1]) { const mb = { type: 'mini', x: b.x + s * 2, y: b.y, r: 3.8, dir: s, speed: d.speed, state: 'fall', vx: s * 40, vy: -70, fallFrom: b.y, plat: pl, rot: 0, age: 0, jumpedId: b.jumpedId, lastLadder: null, hops: 1 }; predictMark(mb); G.barrels.push(mb); }
             } else if (drop > 18 && b.hops < 1) {
               b.hops++; b.vy = -Math.min(95, drop * 0.85); b.fallFrom = b.y; b.y -= 0.5;
               b.dir = slopeDir(pl, Math.sign(b.vx) || b.dir); b.vx = b.dir * Math.abs(b.vx) * 0.6;
-              A.thump(0.8 * vol(b)); spray(b.x, b.y, 1, 3); spray(b.x, b.y, -1, 3);
-              if (drop > 50 && vol(b) > 0.5) G.shake = Math.max(G.shake, 0.8);
+              A.thump(0.8 * vol(b)); spray(b.x, b.y, 1, 2); spray(b.x, b.y, -1, 2); predictMark(b);
             } else {
               b.state = 'roll'; b.hops = 0; b.dir = slopeDir(pl, Math.sign(b.vx) || b.dir); b.vy = 0; b.lastLadder = null;
-              A.thump(0.4 * vol(b));
+              A.thump(0.4 * vol(b)); spaceOut(b);
             }
           }
         }
@@ -936,6 +989,15 @@
     // rumble: louder with more barrels and when one is near the player
     let near = 0; if (p) for (const b of G.barrels) if (b.state === 'roll') near = Math.max(near, 1 - Math.min(1, Math.hypot(b.x - p.x, b.y - p.y) / 70));
     A.setRumble(G.mode === 'play' ? Math.min(0.08 + 0.05 * rumble, 0.22) * (rumble > 0 ? 1 : 0) + near * 0.25 : 0);
+  }
+  // no trap spacing: a barrel arriving 12-50 units behind another (same tier, same way) eases off until there's room to jump, land and jump again
+  function spaceOut(b) {
+    b.spaceT = 0; b.lead = null;
+    for (const o of G.barrels) {
+      if (o === b || o.state !== 'roll' || Math.abs(o.y - b.y) > 5 || o.dir !== b.dir) continue; // same tier (any segment), same way
+      const d = (o.x - b.x) * b.dir;
+      if (d > 12 && d < 50) { b.spaceT = 2; b.lead = o; return; }
+    }
   }
   function vol(b) { return G.p ? clamp(1 - Math.hypot(b.x - G.p.x, b.y - G.p.y) / 160, 0.15, 1) : 0.3; }
 
@@ -959,6 +1021,8 @@
       }
       // riding the chairlift is a breather: barrels dropping past fall behind the seat
       if (p.mover && p.mover.type === 'chair' && b.state !== 'roll') { b.pdx = cx - p.x; continue; }
+      // a catwalk is a roof: a barrel rolling on the tier above can't hit a jump from the tier below (low ceilings on Gondola Run)
+      if (!p.climb && (b.state === 'roll' || b.state === 'teeter') && b.plat && b.plat !== p.ground && p.y > surf(b.plat, clamp(p.x, b.plat.x1, b.plat.x2)) + 2) { b.pdx = cx - p.x; continue; }
       // body hit (hazard hitbox is smaller than the barrel)
       const qx = clamp(cx, px0, px1), qy = clamp(cy, py0, py1);
       if ((qx - cx) * (qx - cx) + (qy - cy) * (qy - cy) < rr * rr && p.inv <= 0) { hurtPlayer('barrel'); return; }
@@ -972,10 +1036,11 @@
         const mult = streakMult(), pts = JUMP_PTS * (b.gold ? GOLD_X : 1) * p.jumpCleared * mult;
         addScore(pts, 'barrels'); A.clear(p.jumpCleared, G.streak); A.whoosh(); vibe(6);
         if (b.gold) G.stats.gold = (G.stats.gold || 0) + 1;
-        pop(p.x, p.y - 22, '+' + pts, b.gold ? '#ffd23f' : p.jumpCleared > 1 ? '#7dffb0' : mult >= 3 ? '#ffb37a' : '#ffe27a', 1.0, Math.min(1.7, (p.jumpCleared > 1 ? 1.35 : 1.1) + (mult - 1) * 0.1));
-        if (p.jumpCleared > 1) pop(p.x, p.y - 40, p.jumpCleared === 2 ? 'DOUBLE!' : 'TRIPLE!', '#7dffb0', 1.0, 1.15 + 0.1 * p.jumpCleared);
-        if (mult > 1 && G.streak === Math.round((mult - 1) * 2) + 1) A.streakUp(mult);
-        if (mult > 1 && G.streak === Math.round((mult - 1) * 2) + 1) pop(p.x, p.y - 48, 'x' + mult + ' STREAK!', '#ffb37a', 0.9, 1.0 + mult * 0.06);
+        p.jumpPts = (p.jumpPts || 0) + pts;
+        const up = mult > 1 && G.streak === Math.round((mult - 1) * 2) + 1;
+        // one pop-up per jump: the points, plus DOUBLE / TRIPLE or the new multiplier
+        pop(p.x, p.y - 22, '+' + p.jumpPts.toLocaleString() + (p.jumpCleared === 2 ? ' DOUBLE' : p.jumpCleared > 2 ? ' TRIPLE' : up ? '  ×' + mult : ''), p.jumpCleared > 1 ? '#7dffb0' : up || mult >= 3 ? '#ffb37a' : '#ffe27a', 1.0, Math.min(1.6, (p.jumpCleared > 1 ? 1.3 : 1.1) + (mult - 1) * 0.08));
+        if (up) A.streakUp(mult);
         burst(p.x, p.y - 4, 6 + mult * 2, ['#ffe27a', '#fff', mult >= 3 ? '#ff9a3a' : '#ffe27a'], 40 + mult * 6, 'spark');
       }
     }
@@ -1020,11 +1085,11 @@
     let h = null;
     if (Math.abs(p.x - G.st.start.x) < 6 && p.ground && p.ground.ground) {
       const gx = G.st.guide ? G.st.guide[0] : (G.ladders.filter((L) => L.botP === p.ground).sort((a, b) => Math.abs(a.x - p.x) - Math.abs(b.x - p.x))[0] || { x: 120 }).x;
-      const right = gx >= p.x; h = { text: right ? 'hold ▶ to run' : 'hold ◀ to run', x: p.x + (right ? 18 : -18), y: p.y - 30 };
+      const right = gx >= p.x; h = { text: right ? 'hold ▶ to run' : 'hold ◀ to run', x: p.x + (right ? 18 : -18), y: p.y - 38 }; // clear of the skier's hat
     }
-    for (const L of G.ladders) if (Math.abs(L.x - p.x) < 14 && p.ground && Math.abs(L.bot - p.y) < 3 && !p.climb) h = { text: '▲ climb', x: L.x, y: L.bot - 26 };
+    for (const L of G.ladders) if (Math.abs(L.x - p.x) < 14 && p.ground && Math.abs(L.bot - p.y) < 3 && !p.climb) h = { text: '▲ climb', x: L.x, y: L.bot - 38 };
     const t0 = G.toks[0]; if (t0 && !t0.taken && p.ground && p.ground.ground && Math.abs(t0.x - p.x) < 34 && !h) h = { text: 'JUMP for the maple leaf!', x: t0.x, y: t0.y - 16 };
-    for (const b of G.barrels) if (b.state === 'roll' && p.ground && Math.abs(b.y - p.y) < 5 && Math.abs(b.x - p.x) < 40 && Math.sign(p.x - b.x) === b.dir) h = { text: 'JUMP!', x: p.x, y: p.y - 30, hot: true };
+    for (const b of G.barrels) if (b.state === 'roll' && p.ground && Math.abs(b.y - p.y) < 5 && Math.abs(b.x - p.x) < 40 && Math.sign(p.x - b.x) === b.dir) h = { text: 'JUMP!', x: p.x, y: p.y - 38, hot: true };
     G.hint = h;
   }
 
@@ -1036,7 +1101,7 @@
     if (G.streakPulse > 0) G.streakPulse = Math.max(0, G.streakPulse - dt * 5);
     if (G.closedFlash > 0) G.closedFlash -= dt;
     if (G.mode === 'play') {
-      G.stats.time += dt; G.lapT += dt;
+      G.stats.time += dt; G.lapT += dt; G.runT += dt;
       if (G.banner > 0) G.banner -= dt;
       // the lift-closing clock
       G.timeLeft = Math.max(0, G.timeLeft - dt);
@@ -1066,9 +1131,9 @@
       updateMoose(dt);
     }
     // sky life: falling snow + lodge chimney smoke (cosmetic only)
-    if (!G.flakes) { G.flakes = []; for (let i = 0; i < 46; i++) G.flakes.push({ x: crnd(-20, 260), y: crnd(-40, 330), z: crnd(0.35, 1), ph: crnd(0, 6) }); }
+    if (!G.flakes) { G.flakes = []; for (let i = 0; i < 24; i++) G.flakes.push({ x: crnd(-20, 260), y: crnd(-60, 120), z: crnd(0.35, 1), ph: crnd(0, 6) }); }
     const wv = G.wind && G.wind.v ? G.wind.v : 0;
-    for (const f of G.flakes) { f.y += (8 + 14 * f.z) * dt; f.x += (Math.sin(G.t * 0.9 + f.ph) * 4 + wv * 2.2) * f.z * dt; if (f.y > 335) { f.y = -8; f.x = crnd(-20, 260); } if (f.x > 270) f.x = -25; if (f.x < -30) f.x = 265; }
+    for (const f of G.flakes) { f.y += (8 + 14 * f.z) * dt; f.x += (Math.sin(G.t * 0.9 + f.ph) * 4 + wv * 2.2) * f.z * dt; if (f.y > 120) { f.y = -60; f.x = crnd(-20, 260); } if (f.x > 270) f.x = -25; if (f.x < -30) f.x = 265; }
     if (G.goalP && cr() < dt * 2.2) { const lg = G.st.lodge, y0 = surf(G.goalP, lg.x + 18); G.smoke.push({ x: lg.x + 27.7, y: y0 - 36, t: 0, life: crnd(2.2, 3.2), r: crnd(1.4, 2.2), vx: crnd(2, 5) + wv * 0.15 }); }
     for (const q of G.smoke) { q.t += dt; q.y -= 7 * dt; q.x += q.vx * dt; q.r += 1.4 * dt; }
     G.smoke = G.smoke.filter((q) => q.t < q.life);
@@ -1134,21 +1199,19 @@
       for (const tl of townLights) tl.y = ly + 15 + tl.dy * 6;
     }
     const mid = ridge(st.id === 'summit' ? 250 : 215, 50, 0, 3.1 + G.stageIdx * 0.7, '#3b3466', null);
-    // ski trails on the mid ridge
-    g.strokeStyle = 'rgba(230,225,255,.22)'; g.lineWidth = 5;
-    for (let i = 0; i < 4; i++) { const x = r() * 260 - 10; g.beginPath(); g.moveTo(x, 190 + r() * 20); g.quadraticCurveTo(x + 20 - r() * 40, 250, x + r() * 40 - 20, 300); g.stroke(); }
+    for (let i = 0; i < 4; i++) { r(); r(); r(); r(); } // (keeps the seeded scenery identical after the old ski-trail streaks were removed)
     // near slope with spruce
     ridge(285, 26, 0, 5.2, '#2a2650', null);
     for (let i = 0; i < 46; i++) {
       const x = v.x0 + r() * (v.x1 - v.x0), y = 268 + r() * 40, h = 10 + r() * 14;
-      g.fillStyle = r() < 0.5 ? '#1c2440' : '#212b4a';
+      g.fillStyle = r() < 0.5 ? '#181f37' : '#1c253f';
       g.beginPath(); g.moveTo(x, y - h); g.lineTo(x - h * 0.32, y); g.lineTo(x + h * 0.32, y); g.closePath(); g.fill();
-      g.fillStyle = 'rgba(230,235,255,.35)'; g.beginPath(); g.moveTo(x, y - h); g.lineTo(x - h * 0.12, y - h * 0.62); g.lineTo(x + h * 0.1, y - h * 0.66); g.closePath(); g.fill();
+      g.fillStyle = 'rgba(230,235,255,.2)'; g.beginPath(); g.moveTo(x, y - h); g.lineTo(x - h * 0.12, y - h * 0.62); g.lineTo(x + h * 0.1, y - h * 0.66); g.closePath(); g.fill();
     }
     }
     // background lift tower lattice + cable for character
     const tx = st.id === 'chair' ? 106 : st.id === 'gondola' ? 210 : 196;
-    g.strokeStyle = 'rgba(30,26,60,.55)'; g.lineWidth = 1.4;
+    g.strokeStyle = 'rgba(30,26,60,.32)'; g.lineWidth = 1.4;
     g.beginPath(); g.moveTo(tx - 4, 330); g.lineTo(tx - 1.5, 40); g.moveTo(tx + 4, 330); g.lineTo(tx + 1.5, 40); g.stroke();
     g.lineWidth = 0.6; g.beginPath(); for (let y = 320; y > 50; y -= 10) { const w1 = lerp(4, 1.5, (330 - y) / 290), w2 = lerp(4, 1.5, (330 - y + 10) / 290); g.moveTo(tx - w1, y); g.lineTo(tx + w2, y - 10); g.moveTo(tx + w1, y); g.lineTo(tx - w2, y - 10); } g.stroke();
     g.lineWidth = 1.4; g.beginPath(); g.moveTo(tx - 14, 42); g.lineTo(tx + 14, 42); g.stroke();
@@ -1158,7 +1221,7 @@
     if (gp) {
       const gr = g.createLinearGradient(0, 318, 0, v.y1); gr.addColorStop(0, '#e9ecff'); gr.addColorStop(0.025, '#aab2e0'); gr.addColorStop(0.1, '#4c4884'); gr.addColorStop(0.4, '#2a2456'); gr.addColorStop(1, '#17122e');
       g.fillStyle = gr; g.fillRect(v.x0, 318, v.x1 - v.x0, v.y1 - 318);
-      g.fillStyle = '#fff'; g.fillRect(v.x0, 317.2, v.x1 - v.x0, 1.4);
+      g.fillStyle = '#dce1f2'; g.fillRect(v.x0, 317.2, v.x1 - v.x0, 1.4);
     }
     paintStructures();
   }
@@ -1212,8 +1275,8 @@
         g.moveTo(p.x1 + 4, p.y1 + th + 3); g.lineTo(p.x2 - 4, p.y2 + th + 3);
         g.stroke();
       }
-      // snow cap on top with soft drips (thinner on ice)
-      g.fillStyle = PAL.snow;
+      // snow cap on top with soft drips (thinner on ice); a shade under pure white, which belongs to the player
+      g.fillStyle = '#dce1f2';
       g.beginPath(); g.moveTo(p.x1 - 0.5, p.y1 + 0.4);
       for (let x = p.x1; x <= p.x2 + 0.01; x += 3) { const y = surf(p, Math.min(x, p.x2)); g.lineTo(Math.min(x, p.x2), y - (p.ice ? 0.4 : 1.1) - (Math.sin(x * 1.7) * 0.25)); }
       g.lineTo(p.x2 + 0.5, p.y2 + 0.4);
@@ -1304,6 +1367,8 @@
     // town lights across the valley
     if (lt > 0 && G.st.id !== 'snowmaking') for (let i = 0; i < townLights.length; i++) { const tl = townLights[i]; if (i / townLights.length > lt) continue; g.fillStyle = tl.c; g.globalAlpha = 0.5 + 0.5 * Math.sin(G.t * 3 + tl.ph); g.fillRect(tl.x, tl.y, 0.8, 0.8); }
     g.globalAlpha = 1;
+    // a little snow in the sky band only (behind everything, faint, fading out above the catwalks)
+    for (const f of G.flakes || []) { const a = 0.25 * f.z * clamp((120 - f.y) / 30, 0, 1); if (a < 0.02) continue; g.fillStyle = 'rgba(245,248,255,' + a.toFixed(3) + ')'; ART.ell(g, f.x, f.y, 0.35 + 0.5 * f.z, 0.35 + 0.5 * f.z); g.fill(); }
     // dusk overlay over the scenery
     g.setTransform(1, 0, 0, 1, 0, 0); g.fillStyle = 'rgba(16,10,50,' + (dk * 0.32).toFixed(3) + ')'; g.fillRect(0, 0, canvas.width, canvas.height);
     g.drawImage(structCanvas, sx * dpr, sy * dpr);
@@ -1317,7 +1382,7 @@
     stringLights(g, lt);
     // pickups
     for (const it of G.items) if (!it.taken) ART.drawPoles(g, it.x, it.y, G.t);
-    for (const tk of G.toks) if (!tk.taken) { if (tk.lift > 14) { g.fillStyle = 'rgba(20,10,40,.2)'; ART.ell(g, tk.x, tk.y + tk.lift, 4.2, 1.1); g.fill(); } ART.drawToken(g, tk.x, tk.y, G.t + tk.ph); const lab = '+' + (tk.val * streakMult()); g.font = '900 6px Nunito, sans-serif'; g.textAlign = 'center'; g.lineWidth = 2; g.strokeStyle = 'rgba(26,18,58,.85)'; g.strokeText(lab, tk.x, tk.y + 14.5); g.fillStyle = tk.val >= 600 ? '#ff9a5a' : tk.val >= 400 ? '#ffd23f' : '#fff'; g.fillText(lab, tk.x, tk.y + 14.5); }
+    for (const tk of G.toks) if (!tk.taken) { if (tk.lift > 14) { g.fillStyle = 'rgba(20,10,40,.2)'; ART.ell(g, tk.x, tk.y + tk.lift, 4.2, 1.1); g.fill(); } ART.drawToken(g, tk.x, tk.y, G.t + tk.ph); }
     // moose
     const m = G.moose;
     if (m) {
@@ -1330,14 +1395,7 @@
     }
     // barrels
     for (const b of G.barrels) {
-      if (b.mark) { const a = 0.5 + 0.3 * Math.sin(G.t * 14); g.strokeStyle = 'rgba(255,90,60,' + a.toFixed(3) + ')'; g.lineWidth = 0.9; ART.ell(g, b.mark.x, b.mark.y - 0.5, 6, 1.8); g.stroke(); g.fillStyle = 'rgba(255,90,60,' + (a * 0.35).toFixed(3) + ')'; g.fill(); }
       g.fillStyle = 'rgba(20,10,40,.22)'; if (b.state === 'roll') { ART.ell(g, b.x, b.y + 0.3, b.r * 0.9, 1); g.fill(); }
-      if ((b.state === 'fall' || b.state === 'ladder') && !b.mark) {
-        // a shadow where it will land, so drops from above are readable
-        let sy = Infinity; for (const q of G.plats) if (b.x >= q.x1 && b.x <= q.x2) { const s2 = surf(q, b.x); if (s2 > b.y + 1 && s2 < sy) sy = s2; }
-        if (sy < Infinity) { const k = clamp(1 - (sy - b.y) / 160, 0.25, 1); g.fillStyle = 'rgba(20,10,40,' + (0.45 * k).toFixed(3) + ')'; ART.ell(g, b.x, sy + 0.2, b.r * (0.5 + 0.6 * k), 1.3); g.fill();
-          if (sy >= 316 && b.y < sy - 14) { const a = 0.5 + 0.3 * Math.sin(G.t * 14); g.strokeStyle = 'rgba(255,90,60,' + a.toFixed(3) + ')'; g.lineWidth = 0.9; ART.ell(g, b.x, sy - 0.5, 6, 1.8); g.stroke(); g.fillStyle = 'rgba(255,90,60,' + (a * 0.3).toFixed(3) + ')'; g.fill(); } }
-      }
       if (b.gold && (b.state === 'roll' || b.state === 'fall')) { // speed streaks trail behind a gold barrel
         const dx = b.state === 'roll' ? b.dir : Math.sign(b.vx || b.dir) || 1; g.strokeStyle = 'rgba(255,226,120,.75)'; g.lineWidth = 0.9; g.lineCap = 'round'; g.beginPath();
         for (let i = 0; i < 3; i++) { const yy = b.y - 3 - i * 3.2, l = 9 - i * 1.6; g.moveTo(b.x - dx * (b.r + 1), yy); g.lineTo(b.x - dx * (b.r + 1 + l), yy); } g.stroke(); g.lineCap = 'butt';
@@ -1359,20 +1417,15 @@
       g.globalAlpha = 0.28 * G.mist.a;
       for (const b of G.barrels) if (b.y > band.y1 - 6 && b.y - 2 * b.r < band.y2 + 6) { if (b.type === 'snow' || b.type === 'mini') ART.drawSnowball(g, b); else ART.drawBarrel(g, b); }
       g.globalAlpha = 1;
-      // landing spots of falling barrels show through the mist as red markers, so a drop is never invisible
-      for (const b of G.barrels) {
-        if (b.state !== 'fall' || b.mark) continue;
-        let sy = Infinity; for (const q of G.plats) if (b.x >= q.x1 && b.x <= q.x2) { const s2 = surf(q, b.x); if (s2 > b.y + 1 && s2 < sy) sy = s2; }
-        if (sy < Infinity && sy > band.y1 - 6 && sy < band.y2 + 6) { const a = (0.45 + 0.3 * Math.sin(G.t * 14)) * G.mist.a; g.strokeStyle = 'rgba(255,90,60,' + a.toFixed(3) + ')'; g.lineWidth = 0.9; ART.ell(g, b.x, sy - 0.5, 6, 1.8); g.stroke(); }
-      }
     }
     if (G.mist) drawGuns(g);
+    drawMarks(g);
     // player
     const p = G.p;
     if (p) {
       const flick = p.inv > 0 && G.mode === 'play' && Math.floor(G.t * 12) % 2 === 0;
       if (flick) g.globalAlpha = 0.45; // ghosted, never invisible
-      ART.drawSkier(g, { x: p.x, y: p.y, face: p.face, state: p.state, t: p.anim, sx: p.sx, sy: p.sy, poles: p.poles > 0 && (p.poles > 2 || Math.floor(G.t * 10) % 2 === 0), swing: p.swing, rot: G.mode === 'dying' ? p.rot : 0, blink: p.blink, hurt: p.hurt });
+      drawPlayer(g, { x: p.x, y: p.y, face: p.face, state: p.state, t: p.anim, sx: p.sx, sy: p.sy, poles: p.poles > 0 && (p.poles > 2 || Math.floor(G.t * 10) % 2 === 0), swing: p.swing, rot: G.mode === 'dying' ? p.rot : 0, blink: p.blink, hurt: p.hurt });
       g.globalAlpha = 1;
       // ladder hint arrow when a ladder is in reach
       if (G.mode === 'play' && !p.climb && (p.ground || p.mover) && p.poles <= 0) {
@@ -1390,7 +1443,7 @@
       const a = 1 - q.t / q.life;
       if (q.k === 'ring') { const e = q.t / q.life; g.strokeStyle = 'rgba(255,255,255,' + (0.7 * (1 - e)).toFixed(3) + ')'; g.lineWidth = 0.8; ART.ell(g, q.x, q.y, 3 + e * 12, 0.8 + e * 2.2); g.stroke(); continue; }
       if (q.k === 'mist') { g.fillStyle = 'rgba(240,246,255,' + (a * 0.5).toFixed(3) + ')'; ART.ell(g, q.x, q.y, q.r, q.r * 0.7); g.fill(); continue; }
-      if (q.k === 'streak') { g.strokeStyle = 'rgba(255,255,255,' + (0.45 * Math.min(1, a * 2)).toFixed(3) + ')'; g.lineWidth = 0.5; g.beginPath(); g.moveTo(q.x, q.y); g.lineTo(q.x - Math.sign(q.vx) * q.r, q.y - q.vy * 0.02); g.stroke(); continue; }
+      if (q.k === 'streak') { g.strokeStyle = 'rgba(190,222,255,' + (0.4 * Math.min(1, a * 2)).toFixed(3) + ')'; g.lineWidth = 0.5; g.beginPath(); g.moveTo(q.x, q.y); g.lineTo(q.x - Math.sign(q.vx) * q.r, q.y - q.vy * 0.02); g.stroke(); continue; }
       g.globalAlpha = Math.min(1, a * 1.5); g.fillStyle = q.c;
       if (q.k === 'chip' || q.k === 'conf') { g.save(); g.translate(q.x, q.y); g.rotate(q.rot); g.fillRect(-q.r, -q.r * 0.5, q.r * 2, q.r); g.restore(); }
       else if (q.k === 'star' || q.k === 'spark') { star(g, q.x, q.y, q.r * 1.6, q.rot); }
@@ -1426,8 +1479,6 @@
       g.fillStyle = h.hot ? 'rgba(255,90,60,.92)' : 'rgba(26,20,58,.85)'; ART.rr(g, clamp(h.x - w / 2, 2, W - w - 2), h.y - 7 + bob, w, 13, 5); g.fill();
       g.fillStyle = '#fff'; g.fillText(h.text, clamp(h.x, w / 2 + 2, W - w / 2 - 2), h.y - 0.5 + bob);
     }
-    // gentle snowfall over the whole scene (near flakes bigger and brighter)
-    for (const f of G.flakes || []) { g.fillStyle = 'rgba(245,248,255,' + (0.25 + 0.5 * f.z).toFixed(3) + ')'; ART.ell(g, f.x, f.y, 0.35 + 0.65 * f.z, 0.35 + 0.65 * f.z); g.fill(); }
     // stage banner
     if (G.banner > 0 && G.mode === 'play') drawBanner(g);
     // where to go: a bobbing marker over the lodge door at the start of each stage (always on during a first climb)
@@ -1442,6 +1493,35 @@
     // vignette at night
     g.setTransform(1, 0, 0, 1, 0, 0);
     drawHUD(g, dk);
+  }
+  // white belongs to the player: a 1-unit white outline and a faint glow make the skier the brightest, clearest shape on the field
+  let skA = null, skB = null;
+  function drawPlayer(g, o) {
+    const BOX = 48, k = S * dpr, pw = Math.max(8, Math.ceil(BOX * k));
+    if (!skA || skA.width !== pw) { skA = document.createElement('canvas'); skB = document.createElement('canvas'); skA.width = skA.height = skB.width = skB.height = pw; }
+    const a = skA.getContext('2d'), b = skB.getContext('2d');
+    a.setTransform(1, 0, 0, 1, 0, 0); a.clearRect(0, 0, pw, pw); a.setTransform(k, 0, 0, k, pw / 2, pw * 0.7);
+    ART.drawSkier(a, Object.assign({}, o, { x: 0, y: 0 }));
+    b.setTransform(1, 0, 0, 1, 0, 0); b.globalCompositeOperation = 'source-over'; b.clearRect(0, 0, pw, pw); b.drawImage(skA, 0, 0);
+    b.globalCompositeOperation = 'source-in'; b.fillStyle = '#fff'; b.fillRect(0, 0, pw, pw); b.globalCompositeOperation = 'source-over';
+    o = Object.assign({}, o, { x: clamp(o.x, 9, W - 9) }); // the skier is ~16 wide: never drawn half off the screen at the side walls
+    const x0 = o.x - BOX / 2, y0 = o.y - BOX * 0.7, ga = g.globalAlpha;
+    const gl = g.createRadialGradient(o.x, o.y - 10, 1, o.x, o.y - 10, 14); gl.addColorStop(0, 'rgba(255,255,255,.10)'); gl.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = gl; ART.ell(g, o.x, o.y - 10, 14, 14); g.fill();
+    g.globalAlpha = ga * 0.95;
+    for (const d of [[-1, 0], [1, 0], [0, -1], [0, 1], [-0.7, -0.7], [0.7, -0.7], [-0.7, 0.7], [0.7, 0.7]]) g.drawImage(skB, x0 + d[0], y0 + d[1], BOX, BOX);
+    g.globalAlpha = ga; g.drawImage(skA, x0, y0, BOX, BOX);
+  }
+  // one warning language for anything coming down: a pulsing red landing marker, from the moment it leaves the edge.
+  // Lobs and bouncers are always marked; ordinary drops only when they land on your tier or the one above (so the field stays calm).
+  function drawMarks(g) {
+    const p = G.p, a = 0.55 + 0.35 * Math.sin(G.t * 14);
+    for (const b of G.barrels) {
+      const mk = b.mark; if (!mk || (b.state !== 'fall' && b.state !== 'bounce')) continue;
+      if (!(b.lob || b.type === 'bouncer') && p && !(mk.y > p.y - 62 && mk.y < p.y + 8)) continue;
+      g.strokeStyle = 'rgba(255,90,60,' + a.toFixed(3) + ')'; g.lineWidth = 0.9; ART.ell(g, mk.x, mk.y - 0.5, 4.5, 1.6); g.stroke();
+      g.fillStyle = 'rgba(255,90,60,' + (a * 0.35).toFixed(3) + ')'; g.fill();
+    }
   }
   function star(g, x, y, r, rot) { g.save(); g.translate(x, y); g.rotate(rot || 0); g.beginPath(); for (let i = 0; i < 10; i++) { const a = i * Math.PI / 5, rr = i % 2 ? r * 0.45 : r; g.lineTo(Math.cos(a) * rr, Math.sin(a) * rr); } g.closePath(); g.fill(); g.restore(); }
   function stringLights(g, lt) {
@@ -1570,30 +1650,20 @@
     g.restore();
   }
   function drawBanner(g) {
-    const t = G.banner, k = t > 1.8 ? (2.2 - t) / 0.4 : t < 0.4 ? t / 0.4 : 1, a = clamp(k, 0, 1);
-    // lives in the empty sky band above the moose, so it never covers the catwalks you're on
-    const bh = G.daily ? 54 : 72;
-    g.save(); g.globalAlpha = a; g.translate(W / 2, 38 + (1 - easeOut(a)) * -8);
-    g.fillStyle = 'rgba(26,18,58,.86)'; ART.rr(g, -104, -26, 208, bh, 10); g.fill();
-    g.strokeStyle = 'rgba(255,210,150,.5)'; g.lineWidth = 0.8; ART.rr(g, -104, -26, 208, bh, 10); g.stroke();
-    g.textAlign = 'center'; g.textBaseline = 'middle';
-    g.fillStyle = '#ffd23f'; g.font = '900 7.5px Nunito, sans-serif'; g.fillText((G.mirror ? 'MIRRORED · ' : '') + (G.daily ? 'DAILY · ' + G.daily.name.toUpperCase() + ' · ' : '') + stageLabel(G.stageIdx, G.loop).toUpperCase() + (G.loop ? '  ·  LOOP ' + (G.loop + 1) : ''), 0, -16);
-    g.fillStyle = '#fff'; g.font = '400 14px "Bowlby One", Impact, sans-serif'; g.fillText(G.st.name.toUpperCase(), 0, -3);
-    g.fillStyle = '#ffd9c0'; g.font = '800 7.5px Nunito, sans-serif';
-    if (G.loop > 0) { g.fillStyle = '#fff'; g.fillText('◆ LAP ' + (G.loop + 1) + ': ' + lapRule(G.loop), 0, 9); g.fillStyle = '#ffd9c0'; }
-    else g.fillText(G.daily ? G.daily.desc : G.st.sub, 0, 9);
-    if (G.daily) { g.fillStyle = '#ffe27a'; g.fillText('3 maple tokens hide on every stage: bonus points', 0, 19); }
-    else {
-      const par = parFor(G.st), bt = save.bt[btKey(G.stageIdx, G.mirror)];
-      g.fillStyle = '#ffe27a'; g.fillText('PAR ' + Math.floor(par / 60) + ':' + String(par % 60).padStart(2, '0') + ' LEFT' + (bt ? '   ·   BEST TIME ' + fmtT(bt) : '') + '   ·   🍁 ×3', 0, 19);
-      const m = save.tix[G.stageIdx] || 0; for (let i = 0; i < 5; i++) ticket(g, -76 + i * 38, 33.5, m & (1 << i), i, 0.58);
-    }
+    // one line in the sky above the moose for 1.5 s: par, best time and tickets live on the MADE IT card
+    const t = G.banner, k = t > 1.25 ? (1.5 - t) / 0.25 : t < 0.35 ? t / 0.35 : 1, a = clamp(k, 0, 1);
+    const txt = ((G.daily ? 'DAILY · ' + G.daily.name + ' · ' : '') + stageLabel(G.stageIdx, G.loop) + ' · ' + G.st.name).toUpperCase();
+    g.save(); g.globalAlpha = a; g.translate(W / 2, 11 + (1 - easeOut(a)) * -6);
+    g.font = '400 9px "Bowlby One", Impact, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    const tw = g.measureText(txt).width, sc = Math.min(1, 212 / tw);
+    g.fillStyle = 'rgba(26,18,58,.72)'; ART.rr(g, -(tw * sc) / 2 - 8, -7.5, tw * sc + 16, 15, 7.5); g.fill();
+    g.scale(sc, sc); g.fillStyle = '#fff'; g.fillText(txt, 0, 0.5);
     g.restore();
   }
   function drawClear(g) {
     const k = clamp(G.modeT / 0.4, 0, 1);
     // up in the sky band, like the stage banner, so the catwalks stay visible while the bonus counts
-    const lm = G.lapMsg, extra = (G.newOutfit && !G.daily ? 11 : 0) + (lm ? 11 : 0);
+    const lm = G.lapMsg, extra = (G.newOutfit && !G.daily ? 11 : 0) + (lm ? (G.daily ? 11 : 22) : 0) + (G.lastChair ? 11 : 0);
     const ch2 = (G.daily ? 44 : 90) + extra;
     g.save(); g.translate(W / 2, G.daily ? 176 : 170); g.scale(0.6 + 0.4 * easeOut(k), 0.6 + 0.4 * easeOut(k)); g.globalAlpha = k;
     g.fillStyle = 'rgba(26,18,58,.88)'; ART.rr(g, -96, -28, 192, ch2, 12); g.fill();
@@ -1616,6 +1686,11 @@
       }
       yy = 58;
     } else yy = 31;
+    if (G.lastChair && G.modeT > 0.7) {
+      const e = clamp((G.modeT - 0.7) / 0.25, 0, 1);
+      g.globalAlpha = k * e; g.fillStyle = '#ff8a6a'; g.font = '900 8px Nunito, sans-serif';
+      g.fillText('LAST CHAIR  +' + LAST_CHAIR.toLocaleString(), 0, yy - (1 - easeOut(e)) * 4); yy += 11; g.globalAlpha = k;
+    }
     if (G.newOutfit && !G.daily && G.modeT > 1.7) {
       const e = clamp((G.modeT - 1.7) / 0.25, 0, 1);
       g.globalAlpha = k * e; g.fillStyle = PAL.jacketL; g.font = '900 7.5px Nunito, sans-serif';
@@ -1625,42 +1700,9 @@
       const e = clamp((G.modeT - 1.0) / 0.25, 0, 1);
       g.globalAlpha = k * e; g.fillStyle = lm.rec && lm.valid ? '#7dffb0' : '#8fe3ff'; g.font = '900 7.5px Nunito, sans-serif';
       g.fillText('LAP DONE ' + fmtT(lm.time) + '  +' + lm.bonus.toLocaleString() + (lm.valid ? (lm.rec ? (lm.old ? '  ·  NEW LAP RECORD!' : '  ·  LAP RECORD SET') : '  ·  best ' + fmtT(lm.old)) : ''), 0, yy - (1 - easeOut(e)) * 4);
+      if (!G.daily) { g.fillStyle = '#fff'; g.fillText('NEXT ◆ LAP: ' + lapRule(G.loop + 1), 0, yy + 11 - (1 - easeOut(e)) * 4); } // the lap's new rule, read while the card is up
     }
     g.restore();
-  }
-
-  // goal chips under the clock: what's still on the table this climb (par pace, no fall, maple tokens)
-  function drawGoals(g, y) {
-    if (G.mode === 'title' || G.mode === 'over' || (G.banner > 0.2 && G.mode === 'play')) return;
-    const xr = cw - insets.r - 56, yc = y + 46, par = parFor(G.st);
-    g.font = '900 9px Nunito, sans-serif'; g.textBaseline = 'middle'; g.textAlign = 'left';
-    const chips = [];
-    if (!G.daily) {
-      const onPar = G.timeLeft >= par || G.mode === 'clear' && (G.tixGot & 2);
-      chips.push({ t: 'SPEEDY ≥' + Math.floor(par / 60) + ':' + String(par % 60).padStart(2, '0'), on: onPar, hot: onPar && G.timeLeft - par < 4 && G.mode === 'play' });
-      chips.push({ t: 'NO FALL', on: G.stageFalls === 0 });
-    }
-    chips.push({ t: G.tokN + '/3', on: G.tokN >= 3, leaf: true, prog: G.tokN > 0 });
-    let w = 0; for (const c of chips) { c.w = g.measureText(c.t).width + 12 + (c.leaf ? 10 : 0); w += c.w + 4; }
-    let x = xr - w + 4;
-    if (G.loop > 0) { // the newest lap rule, always on screen: beside the boots if it fits, else on its own row
-      const t = lapChip(G.loop), lw = g.measureText(t).width + 12, lx2 = insets.l + 10 + 104 - 4, fits = lx2 + lw < x - 3, ly = fits ? yc : yc + 19;
-      g.fillStyle = 'rgba(16,14,32,.9)'; ART.rr(g, fits ? lx2 : cw - insets.r - 56 - lw, ly - 8, lw, 16, 8); g.fill(); g.strokeStyle = 'rgba(255,255,255,.7)'; g.lineWidth = 1; ART.rr(g, fits ? lx2 : cw - insets.r - 56 - lw, ly - 8, lw, 16, 8); g.stroke();
-      g.fillStyle = '#fff'; g.fillText(t, (fits ? lx2 : cw - insets.r - 56 - lw) + 6, ly + 0.5);
-    }
-    for (const c of chips) {
-      const lit = c.on && (!c.leaf || c.on), flash = c.hot && Math.floor(G.t * 6) % 2 === 0;
-      g.fillStyle = c.leaf && c.prog && !c.on ? 'rgba(120,70,20,.85)' : lit ? (flash ? 'rgba(255,255,255,.95)' : 'rgba(255,210,63,.95)') : 'rgba(40,24,80,.72)';
-      ART.rr(g, x, yc - 8, c.w, 16, 8); g.fill();
-      g.strokeStyle = lit ? 'rgba(42,18,6,.5)' : 'rgba(255,255,255,.18)'; g.lineWidth = 1; ART.rr(g, x, yc - 8, c.w, 16, 8); g.stroke();
-      let tx = x + 6;
-      if (c.leaf) { g.save(); g.translate(x + 11, yc); g.scale(0.62, 0.62); ART.mapleLeaf(g, lit ? '#a8301f' : '#ff9a3a'); g.restore(); tx = x + 19; }
-      g.fillStyle = lit ? '#2a1206' : c.leaf && c.prog ? '#ffe9c0' : 'rgba(255,255,255,.45)';
-      g.fillText(c.t, tx, yc + 0.5);
-      if (!lit && !c.leaf) { g.strokeStyle = 'rgba(255,255,255,.4)'; g.lineWidth = 1; g.beginPath(); g.moveTo(tx - 1, yc + 0.5); g.lineTo(tx + c.w - 12 + 1, yc + 0.5); g.stroke(); }
-      x += c.w + 4;
-    }
-    g.textBaseline = 'alphabetic';
   }
 
   function drawHUD(g, dk) {
@@ -1677,22 +1719,20 @@
     const lx = x0 + 104;
     g.fillStyle = '#cdb8ec'; g.font = '900 11px Nunito, sans-serif'; g.fillText(stageLabel(G.stageIdx, G.loop).toUpperCase(), lx, y + 13);
     for (let i = 0; i < Math.min(G.lives, 6); i++) { g.save(); g.translate(lx + 6 + i * 13, y + 31); g.scale(1.3, 1.3); g.fillStyle = PAL.boot; g.strokeStyle = PAL.ink; g.lineWidth = 0.8; g.beginPath(); g.moveTo(-3, -6); g.lineTo(2, -6); g.lineTo(2.4, -2.5); g.lineTo(4.6, -2); g.quadraticCurveTo(5.2, 0, 4, 0); g.lineTo(-3.4, 0); g.closePath(); g.fill(); g.stroke(); g.restore(); }
-    // streak chip under the score: grows and pulses, and shows the multiplier you're earning
-    if (G.streak >= 2 && (G.mode === 'play' || G.mode === 'clear')) {
-      const n = G.streak, m = streakMult(), pulse = G.streakPulse > 0 ? G.streakPulse : 0, sc = 1 + Math.min(n, 12) * 0.018 + pulse * 0.2;
-      const label = 'STREAK ' + n + (m > 1 ? '  ×' + m : ''); g.font = '400 11px "Bowlby One", Impact, sans-serif';
-      const cw2 = Math.max(88, g.measureText(label).width + 22);
-      g.save(); g.translate(x0 + (cw2 / 2) * sc, y + hudH + 14); g.scale(sc, sc);
-      g.fillStyle = m >= 4 ? 'rgba(255,90,60,.92)' : m >= 2 ? 'rgba(255,140,30,.92)' : 'rgba(255,200,70,.88)'; ART.rr(g, -cw2 / 2, -10, cw2, 22, 11); g.fill();
-      g.strokeStyle = 'rgba(42,18,6,.55)'; g.lineWidth = 1.2; ART.rr(g, -cw2 / 2, -10, cw2, 22, 11); g.stroke();
-      g.fillStyle = '#2a1206'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(label, 0, 0);
-      if (decayOn() && m > 1) { const f = clamp(G.streakT / decayTime(), 0, 1), warn = f < 0.3 && Math.floor(G.t * 8) % 2 === 0, bw = cw2 - 20; g.fillStyle = 'rgba(30,10,4,.45)'; ART.rr(g, -bw / 2, 6, bw, 4, 2); g.fill(); g.fillStyle = warn ? '#fff' : '#2a1206'; ART.rr(g, -bw / 2, 6, Math.max(3, bw * f), 4, 2); g.fill(); }
+    // the multiplier, only once it's worth something: "×3" in a disc, with a ring that drains while it waits to be fed
+    const m = streakMult();
+    if (m >= 2 && (G.mode === 'play' || G.mode === 'clear')) {
+      const pulse = G.streakPulse > 0 ? G.streakPulse : 0, sc = 1 + pulse * 0.18, R = 15, cx = x0 + R + 2, cy = y + hudH + 16;
+      g.save(); g.translate(cx, cy); g.scale(sc, sc);
+      g.fillStyle = m >= 4 ? '#ff5a3a' : '#ff8c1e'; ART.ell(g, 0, 0, R, R); g.fill();
+      if (decayOn()) { const f = clamp(G.streakT / decayTime(), 0, 1), warn = f < 0.3 && Math.floor(G.t * 8) % 2 === 0; g.strokeStyle = 'rgba(30,10,4,.35)'; g.lineWidth = 3; ART.ell(g, 0, 0, R + 2.5, R + 2.5); g.stroke(); g.strokeStyle = warn ? '#fff' : '#ffd23f'; g.beginPath(); g.arc(0, 0, R + 2.5, -Math.PI / 2, -Math.PI / 2 + TAU * f); g.stroke(); }
+      g.fillStyle = '#2a1206'; g.font = '400 13px "Bowlby One", Impact, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText('×' + m, 0, 1);
       g.restore(); g.textAlign = 'left'; g.textBaseline = 'alphabetic';
     }
     // lift-closing clock: a pill with a little dial that sweeps down
     const tl = G.mode === 'clear' ? Math.ceil(G.timeLeft) : Math.ceil(G.timeLeft), low = tl <= 10 && G.mode === 'play';
     const pw = 126, px = cw - insets.r - 56 - pw, pcy = y + 19;
-    const flash = low && Math.floor(G.t * 4) % 2 === 0;
+    const flash = low && G.timeLeft % 1 > 0.62; // last ten seconds: the clock pulses red once a second
     g.fillStyle = flash ? 'rgba(255,90,60,.92)' : 'rgba(40,24,80,.8)'; ART.rr(g, px, pcy - 17, pw, 34, 17); g.fill();
     // dial
     const dcx = px + 17, frac = G.timeMax ? G.timeLeft / G.timeMax : 1;
@@ -1701,19 +1741,6 @@
     g.strokeStyle = PAL.ink; g.lineWidth = 1.4; ART.ell(g, dcx, pcy, 12, 12); g.stroke();
     g.textAlign = 'left'; g.fillStyle = low ? '#fff' : '#ffd9c0'; g.font = '900 9.5px Nunito, sans-serif'; g.fillText('LIFT CLOSES', px + 35, pcy - 4);
     g.fillStyle = '#fff'; g.font = '400 16px "Bowlby One", Impact, sans-serif'; g.fillText(Math.floor(tl / 60) + ':' + String(tl % 60).padStart(2, '0'), px + 35, pcy + 13);
-    if (G.mode === 'play' || G.mode === 'dying') { const bm = streakMult(); g.textAlign = 'right'; g.fillStyle = bm > 1 ? '#ffd23f' : 'rgba(255,217,192,.8)'; g.font = '900 9px Nunito, sans-serif'; g.fillText('+' + TIME_PTS * bm + '/s', px + pw - 8, pcy + 12); g.textAlign = 'left'; }
-    drawGoals(g, y);
-    // wind indicator
-    if (G.wind && G.wind.phase !== 'idle' && G.mode === 'play') {
-      const d = G.wind.dir, a = G.wind.phase === 'warn' ? 0.5 + 0.5 * Math.sin(G.t * 14) : 1;
-      g.globalAlpha = a; g.fillStyle = '#bfe9ff'; g.font = '900 11px Nunito, sans-serif'; g.textAlign = 'center';
-      g.fillText(d > 0 ? 'WIND →' : '← WIND', cw / 2, y + hudH + 32); g.globalAlpha = 1;
-    }
-    if (G.p && G.p.poles > 0 && G.mode === 'play') {
-      const f = G.p.poles / (POLES_TIME * (G.mod.poles || 1)), w = 70, x = cw / 2 - w / 2, yy = y + hudH + (G.wind && G.wind.phase !== 'idle' ? 38 : 22);
-      g.fillStyle = 'rgba(20,10,40,.7)'; ART.rr(g, x, yy, w, 7, 3.5); g.fill();
-      g.fillStyle = f < 0.27 && Math.floor(G.t * 8) % 2 ? '#fff' : '#ff6b8a'; ART.rr(g, x + 1, yy + 1, (w - 2) * f, 5, 2.5); g.fill();
-    }
     jumpEl.classList.toggle('poles', !!(G.p && G.p.poles > 0));
   }
 
@@ -1804,7 +1831,7 @@
     keys(o) { Object.assign(kb, { l: 0, r: 0, u: 0, d: 0 }, o || {}); },
     jump() { pressJump(); },
     god(v) { G.god = v !== false; },
-    noBarrels(v) { G.noBarrels = v !== false; G.barrels = []; },
+    noBarrels(v) { G.noBarrels = v !== false; if (G.noBarrels) G.barrels = []; },
     seed(n) { rng = mulberry(n); G.testSeed = true; },
     daily(on) { startGame(0, on !== false); return this.state(); },
     mirror(on) { G.forceMirror = on !== false; },

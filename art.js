@@ -265,13 +265,13 @@
 
   // ---------------------------------------------------------------- barrels / snowballs
   // Sap barrels are painted sugarhouse red so they read instantly against brown catwalks and dusk hills.
-  const BRL = { L: '#ff7a5c', M: '#d8402c', D: '#7e1e16', hoop: '#e3e7f2', hoopD: '#8a93ad', rim: 'rgba(255,236,214,.9)' };
-  const BRL_GOLD = { L: '#ffe48a', M: '#f2b41c', D: '#8a5a06', hoop: '#fff6d8', hoopD: '#b3481c' };
+  // one steel hoop on a red body; a gold barrel is the same red barrel with two gold hoop bands (gold discs belong to maple tokens)
+  const BRL = { L: '#ff7a5c', M: '#d8402c', D: '#7e1e16', hoop: '#c9cfe0', hoopD: '#5a6280' };
+  const BRL_GOLD = { hoop: '#ffd23f', hoopD: '#8a5a06' };
   function drawBarrel(g, b) {
     const r = b.r || 5.6;
     const BRL_ = b.gold ? Object.assign({}, BRL, BRL_GOLD) : BRL;
     g.save(); g.translate(b.x, b.y - r);
-    if (b.gold) { g.fillStyle = 'rgba(255,214,70,' + (0.28 + 0.14 * Math.sin((b.age || 0) * 18)) + ')'; ell(g, 0, 0, r + 3.2, r + 3.2); g.fill(); }
     if (b.glow) { g.fillStyle = 'rgba(255,90,60,' + (0.35 + 0.25 * Math.sin(b.glow * 20)) + ')'; ell(g, 0, 0, r + 3.5, r + 3.5); g.fill(); }
     if (b.side) {
       // upright barrel seen from the side (stack)
@@ -289,8 +289,6 @@
     // 3/4 view: the barrel's red body recedes up-left behind the lid, so it reads as a barrel, not a disc
     g.rotate(-(b.rot || 0)); // body does not spin
     const ox = -R * 0.42, oy = -R * 0.3;
-    g.strokeStyle = BRL_.rim; g.lineWidth = 1.5;
-    ell(g, ox, oy, R + 0.5, R + 0.5); g.stroke(); ell(g, 0, 0, R + 0.5, R + 0.5); g.stroke();
     // body: back end + the band joining it to the lid
     let gb = g.createLinearGradient(ox, oy - R, 0, R);
     gb.addColorStop(0, BRL_.L); gb.addColorStop(0.5, BRL_.M); gb.addColorStop(1, BRL_.D);
@@ -298,24 +296,25 @@
     ell(g, ox, oy, R, R); g.fill(); g.stroke();
     for (let i = 1; i <= 3; i++) { const f = i / 4; ell(g, ox * (1 - f), oy * (1 - f), R * (1 + 0.04 * Math.sin(f * Math.PI)), R * (1 + 0.04 * Math.sin(f * Math.PI))); g.fill(); }
     // staves on the side band, and a steel hoop around the middle of the body
-    g.strokeStyle = b.gold ? 'rgba(90,50,0,.5)' : 'rgba(70,10,8,.45)'; g.lineWidth = 0.5; g.beginPath();
+    g.strokeStyle = 'rgba(70,10,8,.45)'; g.lineWidth = 0.5; g.beginPath();
     for (const a of [-2.3, -1.6, -0.9]) { g.moveTo(ox + Math.cos(a) * R, oy + Math.sin(a) * R); g.lineTo(Math.cos(a) * R, Math.sin(a) * R); }
     g.stroke();
-    g.strokeStyle = BRL_.hoopD; g.lineWidth = 1.5; g.beginPath(); g.arc(ox * 0.5, oy * 0.5, R * 1.03, Math.PI * 0.95, Math.PI * 1.75); g.stroke();
-    g.strokeStyle = BRL_.hoop; g.lineWidth = 0.7; g.beginPath(); g.arc(ox * 0.5, oy * 0.5, R * 1.03, Math.PI * 0.95, Math.PI * 1.75); g.stroke();
+    // a plain barrel has one steel hoop; a fast one has two gold hoop bands on its body (and never a gold ring on the lid: gold discs are tokens)
+    for (const f of b.gold ? [0.28, 0.72] : [0.5]) {
+      g.strokeStyle = BRL_.hoopD; g.lineWidth = b.gold ? 1.7 : 1.5; g.beginPath(); g.arc(ox * f, oy * f, R * 1.03, Math.PI * 0.95, Math.PI * 1.75); g.stroke();
+      g.strokeStyle = BRL_.hoop; g.lineWidth = b.gold ? 1.0 : 0.7; g.beginPath(); g.arc(ox * f, oy * f, R * 1.03, Math.PI * 0.95, Math.PI * 1.75); g.stroke();
+    }
     // lid (spins as it rolls): lighter wood planks across, a steel chime rim, a bung
     g.rotate(b.rot || 0);
     const gl = g.createRadialGradient(-R * 0.3, -R * 0.35, R * 0.1, 0, 0, R);
-    if (b.gold) { gl.addColorStop(0, '#fff4b8'); gl.addColorStop(0.7, '#ffd23f'); gl.addColorStop(1, '#c98a0a'); } else { gl.addColorStop(0, '#ff8a6a'); gl.addColorStop(0.7, '#e2513a'); gl.addColorStop(1, '#a8301f'); }
+    gl.addColorStop(0, '#ff8a6a'); gl.addColorStop(0.7, '#e2513a'); gl.addColorStop(1, '#a8301f');
     g.fillStyle = gl; g.strokeStyle = PAL.ink; g.lineWidth = 0.8; ell(g, 0, 0, R, R); g.fill(); g.stroke();
     g.save(); ell(g, 0, 0, R * 0.8, R * 0.8); g.clip();
     g.strokeStyle = 'rgba(80,14,8,.55)'; g.lineWidth = 0.55; g.beginPath();
     for (const k of [-0.5, -0.17, 0.17, 0.5]) { g.moveTo(-R, k * R * 1.6); g.lineTo(R, k * R * 1.6); }
     g.stroke(); g.restore();
-    g.strokeStyle = BRL_.hoopD; g.lineWidth = 1.5; ell(g, 0, 0, R * 0.86, R * 0.86); g.stroke();
-    g.strokeStyle = BRL_.hoop; g.lineWidth = 0.7; ell(g, 0, 0, R * 0.86, R * 0.86); g.stroke();
+    g.strokeStyle = 'rgba(80,14,8,.7)'; g.lineWidth = 0.9; ell(g, 0, 0, R * 0.84, R * 0.84); g.stroke(); // lid chime: always dark
     g.fillStyle = '#3b1510'; ell(g, R * 0.38, R * 0.1, 1.1, 1.1); g.fill();
-    g.fillStyle = '#ffd36a'; g.beginPath(); g.moveTo(-R * 0.25, -R * 0.42); g.quadraticCurveTo(0, -R * 0.06, -R * 0.25, R * 0.14); g.quadraticCurveTo(-R * 0.5, -R * 0.06, -R * 0.25, -R * 0.42); g.fill();
     // glint (does not rotate)
     g.rotate(-(b.rot || 0));
     g.fillStyle = 'rgba(255,255,255,.5)'; ell(g, -R * 0.4, -R * 0.5, R * 0.22, R * 0.12, -0.6); g.fill();
@@ -338,7 +337,6 @@
   // ---------------------------------------------------------------- pickups
   function drawPoles(g, x, y, t) {
     g.save(); g.translate(x, y - 9 + Math.sin(t * 3) * 1.2);
-    g.fillStyle = 'rgba(255,240,150,' + (0.25 + 0.15 * Math.sin(t * 5)) + ')'; ell(g, 0, 0, 9, 9); g.fill();
     for (const s of [-1, 1]) {
       g.save(); g.rotate(s * 0.35);
       g.strokeStyle = '#e6e9f2'; g.lineWidth = 1.1; g.beginPath(); g.moveTo(0, -8); g.lineTo(0, 7); g.stroke();
@@ -397,17 +395,12 @@
   }
   // maple token: a gold coin with a sugar-maple leaf; bobs, spins a little and glints
   function drawToken(g, x, y, t) {
-    const ti = asset('token'); const bob = Math.sin(t * 3.2) * 1.4;
+    const ti = asset('token'); const bob = Math.sin(t * Math.PI) * 1.1; // one slow bob every 2 s
     g.save(); g.translate(x, y + bob);
-    g.fillStyle = 'rgba(255,214,70,' + (0.22 + 0.12 * Math.sin(t * 5)) + ')'; ell(g, 0, 0, 10.5, 10.5); g.fill();
-    if (ti) { g.drawImage(ti, -7, -7, 14, 14); g.restore(); return; }
-    const sx = 0.82 + 0.18 * Math.cos(t * 2.4);
-    g.scale(sx, 1);
-    const gr = g.createRadialGradient(-2, -2.5, 1, 0, 0, 7.5); gr.addColorStop(0, '#fff4b8'); gr.addColorStop(0.6, '#ffd23f'); gr.addColorStop(1, '#d08a0c');
-    g.fillStyle = gr; g.strokeStyle = PAL.ink; g.lineWidth = 0.9; ell(g, 0, 0, 7, 7); g.fill(); g.stroke();
-    g.strokeStyle = 'rgba(160,90,0,.55)'; g.lineWidth = 0.6; ell(g, 0, 0, 5.5, 5.5); g.stroke();
-    mapleLeaf(g, '#c43a1a');
-    g.fillStyle = 'rgba(255,255,255,.75)'; const k = (Math.sin(t * 3.2 + 1) + 1) / 2; ell(g, -3.2, -3.4, 1.3 + k * 0.6, 0.6); g.fill();
+    if (ti) { g.drawImage(ti, -5, -5, 10, 10); g.restore(); return; }
+    const gr = g.createRadialGradient(-1.6, -1.8, 0.6, 0, 0, 5.4); gr.addColorStop(0, '#fff2a8'); gr.addColorStop(0.6, '#ffd23f'); gr.addColorStop(1, '#d08a0c');
+    g.fillStyle = gr; g.strokeStyle = PAL.ink; g.lineWidth = 0.8; ell(g, 0, 0, 5, 5); g.fill(); g.stroke();
+    g.save(); g.scale(0.66, 0.66); mapleLeaf(g, '#b8361a'); g.restore();
     g.restore();
   }
 
